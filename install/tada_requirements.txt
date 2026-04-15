@@ -1,0 +1,94 @@
+# ============================================================
+# TADA TTS - Python dependencies
+# ============================================================
+# IMPORTANT: This file is used together with install_tada.bat.
+# Several packages are intentionally NOT listed here because
+# they must be installed with special flags in the .bat:
+#
+#   - torch / torchvision / torchaudio  -> step 4  (--index-url PyTorch CDN)
+#   - onnxruntime / onnxruntime-gpu     -> step 6  (cpu or gpu variant)
+#   - faster-whisper                    -> step 7  (--no-deps, onnxruntime conflict)
+#   - descript-audiotools               -> step 7  (--no-deps, protobuf<3.20 metadata bug)
+#   - descript-audio-codec              -> step 7  (--no-deps, after audiotools)
+#   - hume-tada                         -> step 7  (--no-deps, transformers<5 metadata bug)
+#   - protobuf                          -> pulled in by onnxruntime in step 6
+#
+# Known pip warnings that are SAFE TO IGNORE after install:
+#   faster-whisper requires onnxruntime  -> onnxruntime-gpu satisfies this at runtime
+#   descript-audiotools requires protobuf<3.20  -> stale PyPI metadata, code works with 7.x
+#   hume-tada requires transformers<5  -> stale PyPI metadata, HumeAI uv.lock pins 5.3.0
+# ============================================================
+
+# === Core UI ===
+PyQt6==6.10.2
+PyQt6-sip==13.11.1
+PyQt6-Qt6==6.10.2
+
+# === HuggingFace ===
+# 1.7.1 required by transformers 5.x (needs >=1.3.0).
+# Do NOT use 0.36.2 - causes ResolutionImpossible.
+huggingface_hub==1.7.1
+hf_transfer==0.1.9
+hf_xet==1.4.2
+
+# === HTTP stack ===
+# Pre-installed in step 5b of the .bat to cut resolver backtracking.
+# Listed here with exact pins so pip confirms rather than re-resolves.
+certifi==2026.2.25
+idna==3.11
+h11==0.16.0
+anyio==4.12.1
+httpcore==1.0.9
+httpx==0.28.1
+
+# === Audio I/O ===
+sounddevice==0.5.5
+soundfile==0.13.1
+
+# === Numeric / ML core ===
+numpy==2.4.3
+scipy==1.17.1
+
+# === Audio processing / feature extraction ===
+librosa==0.11.0
+lingua-language-detector==2.2.0
+pyyaml==6.0.3
+pydub==0.25.1
+# cffi 2.0.0 per uv.lock
+cffi==2.0.0
+audioread==3.0.1
+decorator==5.2.1
+
+# === faster-whisper runtime deps ===
+# faster-whisper itself is installed --no-deps in the .bat.
+# Its actual runtime dependencies are listed explicitly here:
+ctranslate2==4.7.1
+tokenizers==0.22.2
+tqdm==4.67.3
+av==17.0.0
+
+# === Audio augmentation / separation ===
+demucs==4.0.1
+
+# === Speaker diarization ===
+# omegaconf 2.1.0 has invalid PEP 440 metadata (PyYAML >=5.1.*)
+# rejected by pip>=24.1. Pin 2.3.0 to skip 2.1.0 entirely.
+omegaconf==2.3.0
+pyannote.audio==3.3.2
+
+# === NLP / transformers ===
+# 5.3.0 per HumeAI's own uv.lock. hume-tada PyPI metadata says <5 but is wrong.
+transformers==5.3.0
+safetensors==0.7.0
+
+# === Utilities ===
+num2words>=0.5.14
+rich==14.3.3
+click==8.3.1
+typer==0.24.1
+
+# === Ebook / text input support ===
+lxml
+pymupdf
+mobi
+EbookLib>=0.20
