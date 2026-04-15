@@ -54,8 +54,6 @@ Run **`start.bat`** from the application root folder. It will list all installed
 
 ### Notes
 
-**MOSS TTS** — model weights are not downloaded during installation. Use the *Download model* button inside the application after launching. Available sizes: Local 1.7B (~3.5 GB) and Delay 8B (~16 GB).
-
 **TADA TTS** — requires a Hugging Face account token and **Meta Llama license approval**. During installation a dialog will ask for your token and prompt you to accept the Llama 3.2 license at [huggingface.co/meta-llama/Llama-3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B). Meta approval typically takes 10–20 minutes — do not proceed with installation until you receive the confirmation email.
 
 **Speaker diarization** (the *"I want dubbing"* feature in the SRT tab) requires a Hugging Face token and acceptance of the pyannote model terms. Before using it:
