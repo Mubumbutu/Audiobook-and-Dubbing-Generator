@@ -1,5 +1,7 @@
 # Audiobook and Dubbing Generator
 
+[![Watch the video](https://img.youtube.com/vi/nhQ0yTyRaj4/maxresdefault.jpg)](https://www.youtube.com/watch?v=nhQ0yTyRaj4)
+
 A desktop application for AI-powered text-to-speech synthesis, lektor-style audio generation, ebook narration, and multi-speaker video dubbing.
 
 <img width="1527" height="998" alt="dr" src="https://github.com/user-attachments/assets/1a124398-332b-4b5e-a995-d0e3413820e6" />
