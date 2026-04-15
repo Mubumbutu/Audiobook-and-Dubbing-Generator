@@ -102,3 +102,7 @@ Before using a reference audio file for voice cloning, you can run it through th
 - Vocal isolation using [Demucs](https://github.com/facebookresearch/demucs)
 - Normalization
 - Bit depth selection (PCM output)
+
+## License
+
+[GNU General Public License v3.0](LICENSE)
