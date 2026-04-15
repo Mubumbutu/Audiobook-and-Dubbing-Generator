@@ -1,10 +1,8 @@
-# Audiobook and Dubbing Generator by Mubumbutu
+# Audiobook and Dubbing Generator
 
 A desktop application for AI-powered text-to-speech synthesis, lektor-style audio generation, ebook narration, and multi-speaker video dubbing.
 
-Built with PyQt6 and runs locally on your machine.
-
-> **Windows only.** Installation scripts are provided as `.bat` files.
+<img width="1527" height="998" alt="dr" src="https://github.com/user-attachments/assets/1a124398-332b-4b5e-a995-d0e3413820e6" />
 
 ---
 
