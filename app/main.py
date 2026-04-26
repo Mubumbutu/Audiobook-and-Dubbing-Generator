@@ -3783,6 +3783,21 @@ class MainWindow(QMainWindow):
         vsup_row.addStretch()
         self._lektor_section.add_layout(vsup_row)
 
+        self._keep_original_track_check = QCheckBox("Keep original audio as separate track")
+        self._keep_original_track_check.setChecked(False)
+        self._keep_original_track_check.setEnabled(self._ffmpeg_ok)
+        self._keep_original_track_check.setToolTip(
+            "When enabled, the output video will contain TWO audio tracks instead of one:\n"
+            "  Track 1 — the untouched original audio from the source video\n"
+            "  Track 2 — the original audio mixed together with the lektor dubbing\n\n"
+            "This lets you switch between the original and dubbed audio in your media\n"
+            "player (e.g. VLC: Audio → Audio Track). The original track is set as default.\n\n"
+            "When disabled (default), the output contains a single mixed audio track only\n"
+            "and the original audio cannot be recovered from the exported file.\n\n"
+            "Works best with MKV and MP4 containers. AVI has limited multi-track support."
+        )
+        self._lektor_section.add_widget(self._keep_original_track_check)
+
         fmt_row = QHBoxLayout()
         fmt_row.setSpacing(8)
         fmt_lbl = QLabel("Format:")
@@ -8830,12 +8845,13 @@ class MainWindow(QMainWindow):
         if not out_path:
             return
 
-        sample_rate = 44100
-        offset_ms   = self._offset_spin.value()
-        lektor_wav  = os.path.join(self._output_dir, "_lektor_track_tmp.wav")
-        lektor_vol  = self._lektor_vol.value() / 100.0
-        orig_vol    = self._orig_vol.value() / 100.0
-        use_ducking = self._duck_check.isChecked()
+        sample_rate        = 44100
+        offset_ms          = self._offset_spin.value()
+        lektor_wav         = os.path.join(self._output_dir, "_lektor_track_tmp.wav")
+        lektor_vol         = self._lektor_vol.value() / 100.0
+        orig_vol           = self._orig_vol.value() / 100.0
+        use_ducking        = self._duck_check.isChecked()
+        keep_original_track = self._keep_original_track_check.isChecked()
 
         self._set_status(f"Building lektor track from {done_count} fragments…")
         self._lektor_status.setText("Building lektor track…")
@@ -8898,14 +8914,15 @@ class MainWindow(QMainWindow):
 
         if use_vocal_suppress:
             self._pending_export = {
-                "video_path":         video_path,
-                "lektor_wav":         lektor_wav,
-                "out_path":           out_path,
-                "has_video_audio":    has_video_audio,
-                "lektor_vol":         lektor_vol,
-                "orig_vol":           orig_vol,
-                "use_ducking":        use_ducking,
-                "vocal_suppress_vol": vocal_suppress_vol,
+                "video_path":          video_path,
+                "lektor_wav":          lektor_wav,
+                "out_path":            out_path,
+                "has_video_audio":     has_video_audio,
+                "lektor_vol":          lektor_vol,
+                "orig_vol":            orig_vol,
+                "use_ducking":         use_ducking,
+                "vocal_suppress_vol":  vocal_suppress_vol,
+                "keep_original_track": keep_original_track,
             }
             self._export_btn.setEnabled(False)
             self._progress.setVisible(True)
@@ -8933,6 +8950,7 @@ class MainWindow(QMainWindow):
                 video_path, lektor_wav, out_path,
                 has_video_audio, lektor_vol, orig_vol,
                 use_ducking,
+                keep_original_track=keep_original_track,
             )
 
     def _do_lektor_ffmpeg_export(
@@ -8947,6 +8965,7 @@ class MainWindow(QMainWindow):
         vocals_wav: Optional[str] = None,
         no_vocals_wav: Optional[str] = None,
         vocal_suppress_vol: float = 0.0,
+        keep_original_track: bool = False,
     ):
         use_vocal_suppress = vocals_wav is not None and no_vocals_wav is not None
         extra_tmp = [p for p in [vocals_wav, no_vocals_wav] if p]
@@ -8970,19 +8989,39 @@ class MainWindow(QMainWindow):
                         f"[3:a]volume={lektor_vol:.2f}[lekt];"
                         f"[bg][vox][lekt]amix=inputs=3:duration=first:normalize=0[aout]"
                     )
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", video_path,
-                    "-i", no_vocals_wav,
-                    "-i", vocals_wav,
-                    "-i", lektor_wav,
-                    "-filter_complex", audio_filter,
-                    "-map", "0:v:0",
-                    "-map", "[aout]",
-                    "-c:v", "copy",
-                    "-c:a", "aac", "-b:a", "192k",
-                    out_path,
-                ]
+                if keep_original_track:
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", video_path,
+                        "-i", no_vocals_wav,
+                        "-i", vocals_wav,
+                        "-i", lektor_wav,
+                        "-filter_complex", audio_filter,
+                        "-map", "0:v:0",
+                        "-map", "0:a:0",
+                        "-map", "[aout]",
+                        "-c:v", "copy",
+                        "-c:a", "aac", "-b:a", "192k",
+                        "-metadata:s:a:0", "title=Original",
+                        "-metadata:s:a:1", "title=Dubbing",
+                        "-disposition:a:0", "default",
+                        "-disposition:a:1", "0",
+                        out_path,
+                    ]
+                else:
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", video_path,
+                        "-i", no_vocals_wav,
+                        "-i", vocals_wav,
+                        "-i", lektor_wav,
+                        "-filter_complex", audio_filter,
+                        "-map", "0:v:0",
+                        "-map", "[aout]",
+                        "-c:v", "copy",
+                        "-c:a", "aac", "-b:a", "192k",
+                        out_path,
+                    ]
             else:
                 if use_ducking:
                     audio_filter = (
@@ -8998,17 +9037,35 @@ class MainWindow(QMainWindow):
                         f"[1:a]volume={lektor_vol:.2f}[lekt];"
                         f"[orig][lekt]amix=inputs=2:duration=first:normalize=0[aout]"
                     )
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", video_path,
-                    "-i", lektor_wav,
-                    "-filter_complex", audio_filter,
-                    "-map", "0:v:0",
-                    "-map", "[aout]",
-                    "-c:v", "copy",
-                    "-c:a", "aac", "-b:a", "192k",
-                    out_path,
-                ]
+                if keep_original_track:
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", video_path,
+                        "-i", lektor_wav,
+                        "-filter_complex", audio_filter,
+                        "-map", "0:v:0",
+                        "-map", "0:a:0",
+                        "-map", "[aout]",
+                        "-c:v", "copy",
+                        "-c:a", "aac", "-b:a", "192k",
+                        "-metadata:s:a:0", "title=Original",
+                        "-metadata:s:a:1", "title=Dubbing",
+                        "-disposition:a:0", "default",
+                        "-disposition:a:1", "0",
+                        out_path,
+                    ]
+                else:
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", video_path,
+                        "-i", lektor_wav,
+                        "-filter_complex", audio_filter,
+                        "-map", "0:v:0",
+                        "-map", "[aout]",
+                        "-c:v", "copy",
+                        "-c:a", "aac", "-b:a", "192k",
+                        out_path,
+                    ]
         else:
             cmd = [
                 "ffmpeg", "-y",
@@ -9044,16 +9101,17 @@ class MainWindow(QMainWindow):
             return
         self._pending_export = {}
         self._do_lektor_ffmpeg_export(
-            video_path         = p["video_path"],
-            lektor_wav         = p["lektor_wav"],
-            out_path           = p["out_path"],
-            has_video_audio    = p["has_video_audio"],
-            lektor_vol         = p["lektor_vol"],
-            orig_vol           = p["orig_vol"],
-            use_ducking        = p["use_ducking"],
-            vocals_wav         = vocals_path,
-            no_vocals_wav      = no_vocals_path,
-            vocal_suppress_vol = p["vocal_suppress_vol"],
+            video_path          = p["video_path"],
+            lektor_wav          = p["lektor_wav"],
+            out_path            = p["out_path"],
+            has_video_audio     = p["has_video_audio"],
+            lektor_vol          = p["lektor_vol"],
+            orig_vol            = p["orig_vol"],
+            use_ducking         = p["use_ducking"],
+            vocals_wav          = vocals_path,
+            no_vocals_wav       = no_vocals_path,
+            vocal_suppress_vol  = p["vocal_suppress_vol"],
+            keep_original_track = p.get("keep_original_track", False),
         )
 
     def _on_lektor_export_finished(self, success: bool, error_msg: str, out_path: str):
