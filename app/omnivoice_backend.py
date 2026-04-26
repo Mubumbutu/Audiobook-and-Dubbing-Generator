@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from tts_backends import (
-    TTSBackend, SynthesisRequest, SynthesisResult, register_backend,
+    TTSBackend, SynthesisRequest, SynthesisResult, register_backend, is_rocm,
 )
 
 import gc
@@ -55,7 +55,7 @@ class _OmniVoiceBase(TTSBackend):
         self.model_dir = Path(model_dir)
         self.dtype     = dtype
         self.device    = "cuda" if torch.cuda.is_available() else "cpu"
-        if dtype == torch.float16 and self.device == "cpu":
+        if dtype in (torch.float16, torch.bfloat16) and (self.device == "cpu" or is_rocm()):
             self.dtype = torch.float32
         self._model  = None
         self._loaded = False
