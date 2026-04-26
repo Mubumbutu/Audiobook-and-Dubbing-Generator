@@ -160,3 +160,17 @@ def detect_active_backends() -> List[type[TTSBackend]]:
     if matched:
         return matched
     return list(_BACKENDS.values())
+
+def is_rocm() -> bool:
+    try:
+        import torch
+        return torch.version.hip is not None
+    except Exception:
+        return False
+
+
+def safe_compute_dtype(device: str) -> "torch.dtype":
+    import torch
+    if device == "cuda" and not is_rocm():
+        return torch.bfloat16
+    return torch.float32
