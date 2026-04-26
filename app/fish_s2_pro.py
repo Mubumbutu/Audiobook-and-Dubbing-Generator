@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from tts_backends import (
-    TTSBackend, SynthesisRequest, SynthesisResult, register_backend,
+    TTSBackend, SynthesisRequest, SynthesisResult, register_backend, safe_compute_dtype,
 )
 
 import gc
@@ -329,7 +329,7 @@ class _FishS2ProBase(TTSBackend):
                 f"Failed to import fish_speech:\n{e}\n\n"
                 "Run: pip install git+https://github.com/fishaudio/fish-speech.git")
 
-        precision = torch.bfloat16 if self.device == "cuda" else torch.float32
+        precision = safe_compute_dtype(self.device)
         status(f"Precision: {precision} | device: {self.device}")
 
         is_fp8 = _is_fp8_model(self.model_dir)
