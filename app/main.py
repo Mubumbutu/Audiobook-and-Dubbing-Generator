@@ -1038,7 +1038,7 @@ class DubbingVocalExtractWorker(BaseWorker):
             )
             if r.returncode != 0:
                 raise RuntimeError(
-                    f"ffmpeg audio extraction failed:\n{r.stderr.decode(errors='replace')[-500:]}"
+                    f"ffmpeg audio extraction failed:\n{r.stderr.decode(errors='replace')[-2000:]}"
                 )
 
             self.status.emit(
@@ -1051,8 +1051,14 @@ class DubbingVocalExtractWorker(BaseWorker):
             env = os.environ.copy()
             env["TORCH_HOME"] = str(demucs_cache_dir)
 
+            demucs_wrapper = (
+                "import sys; "
+                "sys.modules.setdefault('torchcodec', type(sys)('torchcodec')); "
+                "from demucs.__main__ import main; "
+                "sys.exit(main() or 0)"
+            )
             r = subprocess.run(
-                [sys.executable, "-m", "demucs",
+                [sys.executable, "-c", demucs_wrapper,
                  "--two-stems=vocals", "-n", "htdemucs_ft",
                  "--out", demucs_out_dir, audio_path],
                 capture_output=True, timeout=3600,
@@ -1060,7 +1066,7 @@ class DubbingVocalExtractWorker(BaseWorker):
             )
             if r.returncode != 0:
                 raise RuntimeError(
-                    f"Demucs failed:\n{r.stderr.decode(errors='replace')[-500:]}"
+                    f"Demucs failed:\n{r.stderr.decode(errors='replace')[-2000:]}"
                 )
 
             stem        = Path(audio_path).stem
@@ -1127,7 +1133,7 @@ class VocalSuppressWorker(BaseWorker):
             )
             if r.returncode != 0:
                 raise RuntimeError(
-                    f"ffmpeg audio extraction failed:\n{r.stderr.decode(errors='replace')[-500:]}"
+                    f"ffmpeg audio extraction failed:\n{r.stderr.decode(errors='replace')[-2000:]}"
                 )
 
             self.status.emit(
@@ -1140,8 +1146,14 @@ class VocalSuppressWorker(BaseWorker):
             env = os.environ.copy()
             env["TORCH_HOME"] = str(demucs_cache_dir)
 
+            demucs_wrapper = (
+                "import sys; "
+                "sys.modules.setdefault('torchcodec', type(sys)('torchcodec')); "
+                "from demucs.__main__ import main; "
+                "sys.exit(main() or 0)"
+            )
             r = subprocess.run(
-                [sys.executable, "-m", "demucs",
+                [sys.executable, "-c", demucs_wrapper,
                  "--two-stems=vocals", "-n", "htdemucs_ft",
                  "--out", demucs_out_dir, audio_path],
                 capture_output=True, timeout=3600,
@@ -1149,7 +1161,7 @@ class VocalSuppressWorker(BaseWorker):
             )
             if r.returncode != 0:
                 raise RuntimeError(
-                    f"Demucs failed:\n{r.stderr.decode(errors='replace')[-500:]}"
+                    f"Demucs failed:\n{r.stderr.decode(errors='replace')[-2000:]}"
                 )
 
             stem          = Path(audio_path).stem
@@ -3797,6 +3809,51 @@ class MainWindow(QMainWindow):
             "Works best with MKV and MP4 containers. AVI has limited multi-track support."
         )
         self._lektor_section.add_widget(self._keep_original_track_check)
+
+        self._dubbed_lang_widget = QWidget()
+        self._dubbed_lang_widget.setStyleSheet("background: transparent;")
+        dubbed_lang_inner = QHBoxLayout(self._dubbed_lang_widget)
+        dubbed_lang_inner.setContentsMargins(0, 0, 0, 0)
+        dubbed_lang_inner.setSpacing(8)
+        dubbed_lang_lbl = QLabel("Dubbing language (ISO 639-2):")
+        dubbed_lang_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
+        self._dubbed_lang_edit = QLineEdit()
+        self._dubbed_lang_edit.setPlaceholderText("e.g. eng")
+        self._dubbed_lang_edit.setMaxLength(3)
+        self._dubbed_lang_edit.setFixedWidth(70)
+        self._dubbed_lang_edit.setFixedHeight(24)
+        self._dubbed_lang_edit.setStyleSheet(f"""
+            QLineEdit {{
+                background: {C["surface"]};
+                border: 1px solid {C["border"]};
+                border-radius: 4px;
+                color: {C["text"]};
+                padding: 2px 6px;
+                font-size: 11px;
+                font-family: 'Consolas';
+            }}
+        """)
+        self._dubbed_lang_edit.setToolTip(
+            "Three-letter ISO 639-2 language code for the dubbing audio track.\n\n"
+            "Media servers such as Plex, Jellyfin and Kodi read this tag to automatically\n"
+            "select the correct audio track for users whose preferred language matches.\n\n"
+            "Common codes:\n"
+            "  eng — English        pol — Polish         deu — German\n"
+            "  fra — French         spa — Spanish        ita — Italian\n"
+            "  rus — Russian        por — Portuguese     jpn — Japanese\n"
+            "  kor — Korean         zho — Chinese        ara — Arabic\n"
+            "  ukr — Ukrainian      hin — Hindi          tur — Turkish\n\n"
+            "Full list: https://www.loc.gov/standards/iso639-2/php/code_list.php\n"
+            "If left blank or invalid, 'und' (undetermined) will be written."
+        )
+        dubbed_lang_inner.addWidget(dubbed_lang_lbl)
+        dubbed_lang_inner.addWidget(self._dubbed_lang_edit)
+        dubbed_lang_inner.addStretch()
+        self._dubbed_lang_widget.setVisible(False)
+        self._keep_original_track_check.toggled.connect(
+            lambda checked: self._dubbed_lang_widget.setVisible(checked)
+        )
+        self._lektor_section.add_widget(self._dubbed_lang_widget)
 
         fmt_row = QHBoxLayout()
         fmt_row.setSpacing(8)
@@ -8845,13 +8902,18 @@ class MainWindow(QMainWindow):
         if not out_path:
             return
 
-        sample_rate        = 44100
-        offset_ms          = self._offset_spin.value()
-        lektor_wav         = os.path.join(self._output_dir, "_lektor_track_tmp.wav")
-        lektor_vol         = self._lektor_vol.value() / 100.0
-        orig_vol           = self._orig_vol.value() / 100.0
-        use_ducking        = self._duck_check.isChecked()
+        sample_rate         = 44100
+        offset_ms           = self._offset_spin.value()
+        lektor_wav          = os.path.join(self._output_dir, "_lektor_track_tmp.wav")
+        lektor_vol          = self._lektor_vol.value() / 100.0
+        orig_vol            = self._orig_vol.value() / 100.0
+        use_ducking         = self._duck_check.isChecked()
         keep_original_track = self._keep_original_track_check.isChecked()
+        if keep_original_track:
+            _raw_lang = self._dubbed_lang_edit.text().strip().lower()
+            dubbed_lang = _raw_lang if (len(_raw_lang) == 3 and _raw_lang.isalpha()) else "und"
+        else:
+            dubbed_lang = "und"
 
         self._set_status(f"Building lektor track from {done_count} fragments…")
         self._lektor_status.setText("Building lektor track…")
@@ -8923,6 +8985,7 @@ class MainWindow(QMainWindow):
                 "use_ducking":         use_ducking,
                 "vocal_suppress_vol":  vocal_suppress_vol,
                 "keep_original_track": keep_original_track,
+                "dubbed_lang":         dubbed_lang,
             }
             self._export_btn.setEnabled(False)
             self._progress.setVisible(True)
@@ -8951,6 +9014,7 @@ class MainWindow(QMainWindow):
                 has_video_audio, lektor_vol, orig_vol,
                 use_ducking,
                 keep_original_track=keep_original_track,
+                dubbed_lang=dubbed_lang,
             )
 
     def _do_lektor_ffmpeg_export(
@@ -8966,6 +9030,7 @@ class MainWindow(QMainWindow):
         no_vocals_wav: Optional[str] = None,
         vocal_suppress_vol: float = 0.0,
         keep_original_track: bool = False,
+        dubbed_lang: str = "pol",
     ):
         use_vocal_suppress = vocals_wav is not None and no_vocals_wav is not None
         extra_tmp = [p for p in [vocals_wav, no_vocals_wav] if p]
@@ -9004,6 +9069,7 @@ class MainWindow(QMainWindow):
                         "-c:a", "aac", "-b:a", "192k",
                         "-metadata:s:a:0", "title=Original",
                         "-metadata:s:a:1", "title=Dubbing",
+                        "-metadata:s:a:1", f"language={dubbed_lang}",
                         "-disposition:a:0", "default",
                         "-disposition:a:1", "0",
                         out_path,
@@ -9050,6 +9116,7 @@ class MainWindow(QMainWindow):
                         "-c:a", "aac", "-b:a", "192k",
                         "-metadata:s:a:0", "title=Original",
                         "-metadata:s:a:1", "title=Dubbing",
+                        "-metadata:s:a:1", f"language={dubbed_lang}",
                         "-disposition:a:0", "default",
                         "-disposition:a:1", "0",
                         out_path,
@@ -9112,6 +9179,7 @@ class MainWindow(QMainWindow):
             no_vocals_wav       = no_vocals_path,
             vocal_suppress_vol  = p["vocal_suppress_vol"],
             keep_original_track = p.get("keep_original_track", False),
+            dubbed_lang         = p.get("dubbed_lang", "pol"),
         )
 
     def _on_lektor_export_finished(self, success: bool, error_msg: str, out_path: str):
