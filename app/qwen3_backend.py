@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from tts_backends import TTSBackend, SynthesisRequest, SynthesisResult, register_backend
+from tts_backends import TTSBackend, SynthesisRequest, SynthesisResult, register_backend, is_rocm, safe_compute_dtype
 
 import gc
 import logging
@@ -101,15 +101,18 @@ class _Qwen3Base(TTSBackend):
 
         status(f"Loading Qwen3TTS from {self.model_dir} on {self.device}")
 
-        dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
+        dtype      = safe_compute_dtype(self.device)
         device_map = "cuda:0" if self.device == "cuda" else "cpu"
 
         if self.device == "cuda":
-            try:
-                import flash_attn
-                attn_impl = "flash_attention_2"
-            except ImportError:
+            if is_rocm():
                 attn_impl = "sdpa"
+            else:
+                try:
+                    import flash_attn
+                    attn_impl = "flash_attention_2"
+                except ImportError:
+                    attn_impl = "sdpa"
         else:
             attn_impl = None
 
