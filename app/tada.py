@@ -12,7 +12,7 @@ import torch
 from huggingface_hub import snapshot_download
 
 from tts_backends import (
-    TTSBackend, SynthesisRequest, SynthesisResult, register_backend,
+    TTSBackend, SynthesisRequest, SynthesisResult, register_backend, safe_compute_dtype,
 )
 
 logger = logging.getLogger(__name__)
@@ -283,7 +283,7 @@ class _TADABase(TTSBackend):
             )
 
         hf_token: Optional[str] = None
-        hf_token_file = _ROOT_DIR / ".hf_token"   # ← katalog główny aplikacji
+        hf_token_file = _ROOT_DIR / ".hf_token"
         if hf_token_file.exists():
             try:
                 hf_token = hf_token_file.read_text(encoding="utf-8").strip() or None
@@ -293,7 +293,7 @@ class _TADABase(TTSBackend):
             os.environ["HF_TOKEN"] = hf_token
             os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
 
-        hf_cache_dir = _ROOT_DIR / "models" / "hf_cache"   # ← katalog główny aplikacji
+        hf_cache_dir = _ROOT_DIR / "models" / "hf_cache"
         hf_cache_dir.mkdir(parents=True, exist_ok=True)
         os.environ["HF_HOME"] = str(hf_cache_dir)
         os.environ["HUGGINGFACE_HUB_CACHE"] = str(hf_cache_dir / "hub")
@@ -357,7 +357,7 @@ class _TADABase(TTSBackend):
             if _tada_mod is not None and "tada" not in sys.modules:
                 sys.modules["tada"] = _tada_mod
 
-        self._dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
+        self._dtype = safe_compute_dtype(self.device)
 
         status(f"Loading TADA encoder from {self.encoder_dir}…")
         try:
