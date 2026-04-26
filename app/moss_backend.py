@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from huggingface_hub import snapshot_download
 
-from tts_backends import TTSBackend, SynthesisRequest, SynthesisResult, register_backend
+from tts_backends import TTSBackend, SynthesisRequest, SynthesisResult, register_backend, is_rocm, safe_compute_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +245,7 @@ class _MossTTSBase(TTSBackend):
     def _resolve_attn_impl(self, dtype) -> str:
         if (
             self.device == "cuda"
+            and not is_rocm()
             and importlib.util.find_spec("flash_attn") is not None
             and dtype in {torch.float16, torch.bfloat16}
         ):
@@ -283,11 +284,11 @@ class _MossTTSBase(TTSBackend):
                 "Run: pip install transformers>=5.0.0"
             )
 
-        dtype    = torch.bfloat16 if self.device == "cuda" else torch.float32
+        dtype     = safe_compute_dtype(self.device)
         attn_impl = self._resolve_attn_impl(dtype)
         status(f"Attention: {attn_impl} | Device: {self.device} | Dtype: {dtype}")
 
-        if self.device == "cuda":
+        if self.device == "cuda" and not is_rocm():
             torch.backends.cuda.enable_cudnn_sdp(False)
             torch.backends.cuda.enable_flash_sdp(True)
             torch.backends.cuda.enable_mem_efficient_sdp(True)
