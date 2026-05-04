@@ -34,7 +34,8 @@ from PyQt6.QtWidgets import (
     QSlider, QSpinBox, QGroupBox, QFileDialog, QProgressBar,
     QScrollArea, QFrame, QSplitter, QStatusBar, QSizePolicy,
     QMessageBox, QComboBox, QCheckBox, QMenu, QTabWidget, QLineEdit,
-    QGridLayout, QDialog, QDialogButtonBox, QInputDialog, QDoubleSpinBox, QHeaderView
+    QGridLayout, QDialog, QDialogButtonBox, QInputDialog, QDoubleSpinBox, QHeaderView,
+    QRadioButton,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl, QFileSystemWatcher
 from PyQt6.QtGui import (
@@ -75,6 +76,17 @@ ROOT_DIR    = APP_DIR.parent
 WHISPER_DIR = ROOT_DIR / "models" / "whisper"
 OUTPUTS_DIR = ROOT_DIR / "outputs"
 PROC_DIR    = ROOT_DIR / "outputs" / "preprocessed"
+_LAST_DIRS: Dict[str, str] = {}
+
+
+def _get_last_dir(key: str, fallback: str = "") -> str:
+    return _LAST_DIRS.get(key) or fallback or str(Path.home())
+
+
+def _set_last_dir(key: str, path: str) -> None:
+    d = path if os.path.isdir(path) else str(Path(path).parent)
+    if os.path.isdir(d):
+        _LAST_DIRS[key] = d
 
 os.environ.setdefault("TORCH_HOME", str(ROOT_DIR / "models" / "torch_hub"))
 OUTPUTS_DIR.mkdir(exist_ok=True)
@@ -470,6 +482,16 @@ def _convert_numbers_in_text(text: str, lang: str) -> str:
 
     return re.sub(r"\b\d{1,3}(?:[,\s]\d{3})*(?:\.\d+)?\b|\b\d+(?:\.\d+)?\b", _replace, text)
 
+def _normalize_text_for_tts(text: str) -> str:
+    text = text.replace("\u2026", "...")
+    def _fix_token(m: re.Match) -> str:
+        token = m.group(0)
+        alpha_chars = [c for c in token if c.isalpha()]
+        if len(alpha_chars) >= 2 and all(c.isupper() for c in alpha_chars):
+            return token.title()
+        return token
+    return re.sub(r"\S+", _fix_token, text)
+
 def _trim_silence_wav(path: str) -> None:
     audio, sr = sf.read(path, dtype="float32")
     if audio.ndim > 1:
@@ -586,8 +608,12 @@ class TTSWorker(QThread):
             if self._cancelled:
                 break
 
-            idx  = fragment.get("index", 0)
-            text = fragment.get("text", "").strip()
+            idx    = fragment.get("index", 0)
+            raw    = fragment.get("text", "").strip()
+            prefix = (fragment.get("prefix") or "").strip()
+            suffix = (fragment.get("suffix") or "").strip()
+            parts  = [x for x in [prefix, raw, suffix] if x]
+            text   = _normalize_text_for_tts(" ".join(parts))
 
             if not text:
                 self.item_done.emit(idx, "", False)
@@ -678,7 +704,7 @@ class GenerateWorker(BaseWorker):
     def run(self):
         try:
             audio, sr = self.backend.generate(
-                text=self.text,
+                text=_normalize_text_for_tts(self.text),
                 reference_audio_path=self.ref_audio,
                 reference_text=self.ref_text,
                 progress_cb=lambda m: self.status.emit(m),
@@ -2250,10 +2276,11 @@ class DropAudioWidget(QFrame):
             path, _ = QFileDialog.getOpenFileName(
                 self,
                 "Select audio file",
-                "",
+                _get_last_dir("audio"),
                 "Audio files (*.wav *.mp3 *.flac *.ogg)"
             )
             if path:
+                _set_last_dir("audio", path)
                 self._file = path
                 self._name.setText(os.path.basename(path))
                 self.file_dropped.emit(path)
@@ -2488,7 +2515,6 @@ class MainWindow(QMainWindow):
         self._epub_path:            Optional[str]   = None
         self._ebook_output_dir:     str             = str(OUTPUTS_DIR)
         self._synthesis_source:     str             = 'srt'
-        self._global_prefix:        str             = ""
 
         self._timer = QTimer(self)
         self._timer.setInterval(80)
@@ -3966,8 +3992,12 @@ class MainWindow(QMainWindow):
         self._audiobook_section.add_widget(self._audiobook_status_lbl)
  
     def _browse_audiobook_output(self):
-        d = QFileDialog.getExistingDirectory(self, "Select output folder")
+        d = QFileDialog.getExistingDirectory(
+            self, "Select output folder",
+            _get_last_dir("output", str(OUTPUTS_DIR))
+        )
         if d:
+            _set_last_dir("output", d)
             self._audiobook_output_edit.setText(d)
             self._ebook_output_dir = d
 
@@ -4200,7 +4230,9 @@ class MainWindow(QMainWindow):
         silence_ms = self._audiobook_silence_spin.value()
 
         base_name = Path(self._epub_path).stem if self._epub_path else "audiobook"
-        default_path = str(Path(self._ebook_output_dir) / f"{base_name}.{fmt}")
+        default_path = str(
+            Path(_get_last_dir("output", self._ebook_output_dir)) / f"{base_name}.{fmt}"
+        )
 
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -4212,6 +4244,8 @@ class MainWindow(QMainWindow):
             return
         if not path.lower().endswith(f".{fmt}"):
             path += f".{fmt}"
+
+        _set_last_dir("output", path)
 
         self._set_status("Exporting audiobook...")
         self._progress.setVisible(True)
@@ -4940,11 +4974,12 @@ class MainWindow(QMainWindow):
                 "This feature requires ffmpeg installed in PATH.")
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select video file", "",
+            self, "Select video file", _get_last_dir("video"),
             "Video (*.mp4 *.mkv *.avi *.mov *.webm *.wmv);;All files (*)",
         )
         if not path:
             return
+        _set_last_dir("video", path)
         self._video_source_path = path
         self._btn_show_video_wave.setEnabled(False)
         self._btn_show_video_wave.setText("⏳  Extracting audio…")
@@ -4953,16 +4988,6 @@ class MainWindow(QMainWindow):
 
         self._w_vid_extract = VideoAudioExtractWorker(path)
         self._w_vid_extract.status.connect(lambda m: self._set_status(m))
-        self._w_vid_extract.finished.connect(self._on_video_audio_extracted)
-        self._w_vid_extract.error.connect(
-            lambda e: self._on_error("Video audio extraction error", e,
-                reset_fn=lambda: (
-                    self._btn_show_video_wave.setEnabled(True),
-                    self._btn_show_video_wave.setText("🎬  Show Waveform from video"),
-                    self._progress.setVisible(False),
-                ))
-        )
-        self._w_vid_extract.start()
 
     def _on_video_audio_extracted(self, wav_path: str):
         self._progress.setVisible(False)
@@ -5225,11 +5250,12 @@ class MainWindow(QMainWindow):
         
     def _load_srt_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open SRT / TXT file", str(Path.home()),
+            self, "Open SRT / TXT file", _get_last_dir("srt"),
             "Subtitle files (*.srt *.txt);;SRT Subtitles (*.srt);;TXT Subtitles (*.txt);;All files (*)",
         )
         if not path:
             return
+        _set_last_dir("srt", path)
 
         ext = Path(path).suffix.lower()
 
@@ -5356,13 +5382,14 @@ class MainWindow(QMainWindow):
 
     def _load_ebook_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open ebook file", str(Path.home()),
+            self, "Open ebook file", _get_last_dir("ebook"),
             "Ebook files (*.epub *.pdf *.mobi *.azw *.azw3 *.fb2 *.txt)"
             ";;EPUB (*.epub);;PDF (*.pdf);;Kindle (*.mobi *.azw *.azw3)"
             ";;FictionBook (*.fb2);;TXT (*.txt);;All files (*)",
         )
         if not path:
             return
+        _set_last_dir("ebook", path)
 
         ext = Path(path).suffix.lower()
 
@@ -7179,8 +7206,13 @@ class MainWindow(QMainWindow):
             'error':   STATUS_ERROR,
         }.get(status, STATUS_WAITING)
 
-        num = frag['index'] + 1
-        item.setText(COL_FRAGMENT, f"{icon}  #{num}  {frag.get('text', '')[:75]}")
+        num        = frag['index'] + 1
+        base_text  = frag.get('text', '')
+        prefix     = (frag.get('prefix') or '').strip()
+        suffix     = (frag.get('suffix') or '').strip()
+        parts      = [x for x in [prefix, base_text, suffix] if x]
+        display    = " ".join(parts)
+        item.setText(COL_FRAGMENT, f"{icon}  #{num}  {display[:75]}")
         item.setText(COL_SPEAKER, frag.get('speaker') or "")
         item.setForeground(COL_FRAGMENT, QColor(C["text"]))
 
@@ -7713,7 +7745,7 @@ class MainWindow(QMainWindow):
         if not self._fragments or not self._chapter_item:
             return
 
-        checked_indices = set()
+        checked_indices: set = set()
         for i in range(self._chapter_item.childCount()):
             child = self._chapter_item.child(i)
             if (not child.isHidden()
@@ -7729,25 +7761,40 @@ class MainWindow(QMainWindow):
             )
             return
 
+        checked_frags = [f for f in self._fragments if f['index'] in checked_indices]
+
         dlg = QDialog(self)
         dlg.setWindowTitle("Add text to selected fragments")
-        dlg.resize(500, 160)
+        dlg.resize(540, 310)
         dlg.setStyleSheet(self.styleSheet())
 
         lay = QVBoxLayout(dlg)
         lay.setSpacing(10)
 
-        info = QLabel(
-            f"Text entered here will be prepended to {len(checked_indices)} checked fragment(s).\n"
-            "Leave empty to remove the current prefix."
+        radio_row = QHBoxLayout()
+        rb_prepend = QRadioButton("Prepend  (add before text)")
+        rb_append  = QRadioButton("Append  (add after text)")
+        rb_prepend.setChecked(True)
+        radio_row.addWidget(rb_prepend)
+        radio_row.addWidget(rb_append)
+        radio_row.addStretch()
+        lay.addLayout(radio_row)
+
+        state_lbl = QLabel()
+        state_lbl.setStyleSheet(
+            f"color:{C['text2']};font-size:11px;"
+            f"background:{C['surface']};padding:6px 8px;"
+            f"border:1px solid {C['border']};border-radius:3px;"
         )
-        info.setStyleSheet(f"color:{C['text2']};font-size:11px;")
-        lay.addWidget(info)
+        state_lbl.setWordWrap(True)
+        lay.addWidget(state_lbl)
+
+        field_lbl = QLabel()
+        field_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
+        lay.addWidget(field_lbl)
 
         editor = QLineEdit()
         editor.setFont(QFont("Segoe UI", 12))
-        editor.setText(self._global_prefix)
-        editor.selectAll()
         lay.addWidget(editor)
 
         btns = QDialogButtonBox(
@@ -7757,38 +7804,63 @@ class MainWindow(QMainWindow):
         btns.rejected.connect(dlg.reject)
         lay.addWidget(btns)
 
+        def _build_counts(use_prefix: bool) -> Dict[str, int]:
+            key = 'prefix' if use_prefix else 'suffix'
+            counts: Dict[str, int] = {}
+            for f in checked_frags:
+                v = (f.get(key) or '').strip()
+                counts[v] = counts.get(v, 0) + 1
+            return counts
+
+        def _update_mode():
+            is_prepend = rb_prepend.isChecked()
+            mode_word  = "prefix" if is_prepend else "suffix"
+            counts     = _build_counts(is_prepend)
+            lines = []
+            for v, cnt in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
+                label = f'"{v}"' if v else "(none)"
+                lines.append(f"  {label}  ·  {cnt} fragment(s)")
+            state_lbl.setText(
+                f"Current {mode_word} in {len(checked_indices)} checked fragment(s):\n"
+                + "\n".join(lines)
+            )
+            field_lbl.setText(
+                f"New {mode_word} for all checked fragments "
+                f"(leave empty to clear):"
+            )
+            common = list(counts.keys())[0] if len(counts) == 1 else ""
+            editor.setText(common)
+            editor.selectAll()
+
+        rb_prepend.toggled.connect(_update_mode)
+        _update_mode()
         editor.setFocus()
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        new_prefix = editor.text()
-        old_prefix = self._global_prefix
+        new_text   = editor.text().strip()
+        is_prepend = rb_prepend.isChecked()
+        key        = 'prefix' if is_prepend else 'suffix'
+        mode_word  = "prefix" if is_prepend else "suffix"
 
         for frag in self._fragments:
             if frag['index'] not in checked_indices:
                 continue
-            text = frag.get('text', '')
-            if old_prefix and text.startswith(old_prefix):
-                text = text[len(old_prefix):]
-                if text.startswith(' '):
-                    text = text[1:]
-            if new_prefix:
-                text = new_prefix + ' ' + text
-            frag['text'] = text
-            frag['status'] = 'waiting'
+            frag[key]         = new_text
+            frag['status']    = 'waiting'
             frag['error_msg'] = None
             self._update_tree_item(frag['index'])
 
-        self._global_prefix = new_prefix
-
-        if new_prefix:
+        if new_text:
             self._set_status(
-                f"Prefix '{new_prefix}' applied to {len(checked_indices)} fragment(s) — status reset to waiting."
+                f"{mode_word.capitalize()} '{new_text}' applied to {len(checked_indices)} "
+                f"fragment(s) — status reset to waiting."
             )
         else:
             self._set_status(
-                f"Prefix removed from {len(checked_indices)} fragment(s) — status reset to waiting."
+                f"{mode_word.capitalize()} cleared for {len(checked_indices)} "
+                f"fragment(s) — status reset to waiting."
             )
 
     def _edit_fragment_text(self, frag: Dict):
@@ -8682,14 +8754,17 @@ class MainWindow(QMainWindow):
         if self._audio_data is None:
             return
 
+        default_path = str(Path(_get_last_dir("output", str(OUTPUTS_DIR))) / f"audio.{fmt}")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save audio", str(OUTPUTS_DIR / f"audio.{fmt}"),
+            self, "Save audio", default_path,
             f"Audio {fmt.upper()} (*.{fmt});;All files (*)",
         )
         if not path:
             return
         if not path.lower().endswith(f".{fmt}"):
             path = f"{path}.{fmt}"
+
+        _set_last_dir("output", path)
 
         audio = np.asarray(self._audio_data, dtype=np.float32)
         sr    = int(self._audio_sr)
@@ -8806,10 +8881,11 @@ class MainWindow(QMainWindow):
 
     def _browse_video_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select video file", "",
+            self, "Select video file", _get_last_dir("video"),
             "Video (*.mp4 *.mkv *.avi *.mov *.webm *.wmv);;All files (*)",
         )
         if path:
+            _set_last_dir("video", path)
             self._vid_path_edit.setText(path)
 
     def _normalize_ffmpeg(self, input_path: str, output_path: str) -> bool:
@@ -8894,13 +8970,17 @@ class MainWindow(QMainWindow):
         else:
             video_ext = f".{fmt}"
 
-        default_out = os.path.join(self._output_dir, f"lektor_output{video_ext}")
+        default_out = os.path.join(
+            _get_last_dir("output", self._output_dir), f"lektor_output{video_ext}"
+        )
         out_path, _ = QFileDialog.getSaveFileName(
             self, "Save video with lektor", default_out,
             f"Video (*{video_ext});;All files (*)",
         )
         if not out_path:
             return
+
+        _set_last_dir("output", out_path)
 
         sample_rate         = 44100
         offset_ms           = self._offset_spin.value()
@@ -9208,12 +9288,16 @@ class MainWindow(QMainWindow):
     def _save_session(self):
         if not self._srt_path:
             return
+        default_path = str(
+            Path(_get_last_dir("session", str(OUTPUTS_DIR))) / "session.json"
+        )
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save session", str(OUTPUTS_DIR / "session.json"),
+            self, "Save session", default_path,
             "JSON (*.json);;All files (*)",
         )
         if not path:
             return
+        _set_last_dir("session", path)
         if self._write_session_to(path):
             auto = self._auto_session_path()
             if auto and str(auto) != path:
@@ -9520,13 +9604,16 @@ class MainWindow(QMainWindow):
     def _save_ebook_session(self):
         if not self._epub_path:
             return
+        default_path = str(
+            Path(_get_last_dir("session", str(OUTPUTS_DIR))) / "ebook_session.json"
+        )
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save ebook session",
-            str(OUTPUTS_DIR / "ebook_session.json"),
+            self, "Save ebook session", default_path,
             "JSON (*.json);;All files (*)",
         )
         if not path:
             return
+        _set_last_dir("session", path)
         if self._write_ebook_session_to(path):
             auto = self._auto_ebook_session_path()
             if auto and str(auto) != path:
@@ -9614,18 +9701,19 @@ class MainWindow(QMainWindow):
 
     def _load_session(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load session", str(OUTPUTS_DIR),
+            self, "Load session", _get_last_dir("session", str(OUTPUTS_DIR)),
             "JSON (*.json);;All files (*)",
         )
         if not path:
             return
+        _set_last_dir("session", path)
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
         except Exception as e:
             QMessageBox.critical(self, "Load error", str(e))
             return
- 
+
         if data.get("session_type") == "ebook":
             self._restore_ebook_session_data(data)
         else:
@@ -9809,12 +9897,13 @@ class MainWindow(QMainWindow):
                     return
 
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select video file for dubbing", "",
+            self, "Select video file for dubbing", _get_last_dir("video"),
             "Video (*.mp4 *.mkv *.avi *.mov *.webm *.wmv);;All files (*)",
         )
         if not path:
             return
 
+        _set_last_dir("video", path)
         self._dubbing_video_path = path
         self._hf_token           = hf_token
         self._btn_dubbing.setEnabled(False)
