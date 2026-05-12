@@ -19,13 +19,14 @@ echo  [4]  OmniVoice
 echo  [5]  Qwen3 TTS
 echo  [6]  TADA TTS  (requires HuggingFace token + Meta license approval)
 echo  [7]  VoxCPM 2
+echo  [8]  Supertonic 3
 echo.
 echo  [0]  Exit
 echo.
 
 :PICK
 set CHOICE=
-set /p CHOICE=Enter choice [0-7]: 
+set /p CHOICE=Enter choice [0-8]: 
 
 if "!CHOICE!"=="0" goto :EXIT
 if "!CHOICE!"=="1" goto :CHATTERBOX
@@ -35,8 +36,9 @@ if "!CHOICE!"=="4" goto :OMNIVOICE
 if "!CHOICE!"=="5" goto :QWEN3
 if "!CHOICE!"=="6" goto :TADA
 if "!CHOICE!"=="7" goto :VOXCPM2
+if "!CHOICE!"=="8" goto :SUPERTONIC
 
-echo  Invalid choice. Please enter a number from 0 to 7.
+echo  Invalid choice. Please enter a number from 0 to 8.
 goto :PICK
 
 :CHATTERBOX
@@ -72,6 +74,11 @@ goto :RUN
 :VOXCPM2
 set "SCRIPT=%APP_ROOT%install\voxcpm2_install.bat"
 set "MODEL=VoxCPM 2"
+goto :RUN
+
+:SUPERTONIC
+set "SCRIPT=%APP_ROOT%install\supertonic_install.bat"
+set "MODEL=Supertonic 3"
 goto :RUN
 
 :RUN
