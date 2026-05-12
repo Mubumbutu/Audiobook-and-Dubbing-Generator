@@ -78,6 +78,7 @@ The app supports multiple TTS backends. Available backends are detected automati
 | Qwen3 TTS | [huggingface.co/collections/Qwen/qwen3-tts](https://huggingface.co/collections/Qwen/qwen3-tts) |
 | TADA | [huggingface.co/HumeAI/tada-3b-ml](https://huggingface.co/HumeAI/tada-3b-ml) · [tada-1b](https://huggingface.co/HumeAI/tada-1b) |
 | VoxCPM2 | [huggingface.co/openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) |
+| Supertonic 3 | [huggingface.co/Supertone/supertonic-3](https://huggingface.co/Supertone/supertonic-3) |
 
 Most backends support **voice cloning** via a reference audio file. You can upload a reference `.wav`, optionally pre-process it (resample, convert to mono, normalize, isolate vocals via Demucs), and optionally transcribe it using Whisper before synthesis.
 
