@@ -12,33 +12,37 @@ echo ============================================================
 echo.
 echo  Select the TTS model you want to install:
 echo.
-echo  [1]  Chatterbox TTS
-echo  [2]  Fish Audio Speech-2 Pro
-echo  [3]  MOSS TTS
-echo  [4]  OmniVoice
-echo  [5]  Qwen3 TTS
-echo  [6]  TADA TTS  (requires HuggingFace token + Meta license approval)
-echo  [7]  VoxCPM 2
-echo  [8]  Supertonic 3
+echo  [1]   Chatterbox TTS
+echo  [2]   Fish Audio Speech-2 Pro
+echo  [3]   MOSS TTS
+echo  [4]   OmniVoice
+echo  [5]   Qwen3 TTS
+echo  [6]   TADA TTS  (requires HuggingFace token + Meta license approval)
+echo  [7]   VoxCPM 2
+echo  [8]   Supertonic 3
+echo  [9]   Piper TTS
+echo  [10]  XTTS v2  (Coqui TTS)
 echo.
-echo  [0]  Exit
+echo  [0]   Exit
 echo.
 
 :PICK
 set CHOICE=
-set /p CHOICE=Enter choice [0-8]: 
+set /p CHOICE=Enter choice [0-10]: 
 
-if "!CHOICE!"=="0" goto :EXIT
-if "!CHOICE!"=="1" goto :CHATTERBOX
-if "!CHOICE!"=="2" goto :FISH
-if "!CHOICE!"=="3" goto :MOSS
-if "!CHOICE!"=="4" goto :OMNIVOICE
-if "!CHOICE!"=="5" goto :QWEN3
-if "!CHOICE!"=="6" goto :TADA
-if "!CHOICE!"=="7" goto :VOXCPM2
-if "!CHOICE!"=="8" goto :SUPERTONIC
+if "!CHOICE!"=="0"  goto :EXIT
+if "!CHOICE!"=="1"  goto :CHATTERBOX
+if "!CHOICE!"=="2"  goto :FISH
+if "!CHOICE!"=="3"  goto :MOSS
+if "!CHOICE!"=="4"  goto :OMNIVOICE
+if "!CHOICE!"=="5"  goto :QWEN3
+if "!CHOICE!"=="6"  goto :TADA
+if "!CHOICE!"=="7"  goto :VOXCPM2
+if "!CHOICE!"=="8"  goto :SUPERTONIC
+if "!CHOICE!"=="9"  goto :PIPER
+if "!CHOICE!"=="10" goto :XTTSV2
 
-echo  Invalid choice. Please enter a number from 0 to 8.
+echo  Invalid choice. Please enter a number from 0 to 10.
 goto :PICK
 
 :CHATTERBOX
@@ -79,6 +83,16 @@ goto :RUN
 :SUPERTONIC
 set "SCRIPT=%APP_ROOT%install\supertonic_install.bat"
 set "MODEL=Supertonic 3"
+goto :RUN
+
+:PIPER
+set "SCRIPT=%APP_ROOT%install\piper_install.bat"
+set "MODEL=Piper TTS"
+goto :RUN
+
+:XTTSV2
+set "SCRIPT=%APP_ROOT%install\xttsv2_install.bat"
+set "MODEL=XTTS v2 (Coqui TTS)"
 goto :RUN
 
 :RUN
