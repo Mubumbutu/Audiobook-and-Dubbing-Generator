@@ -61,6 +61,9 @@ import qwen3_backend
 import voxcpm2_backend
 import supertonic_backend
 from supertonic_backend import SUPERTONIC_VOICES
+import piper_backend
+from piper_backend import _voice_options as _piper_voice_options
+import xttsv2_backend
 from input_formats import get_format
 from tts_backends import (
     SynthesisRequest, SynthesisResult,
@@ -640,8 +643,7 @@ class TTSWorker(QThread):
 
             if self.speaker_voices:
                 speaker = fragment.get("speaker") or ""
-                sv = (self.speaker_voices.get(speaker)
-                      or next(iter(self.speaker_voices.values()), None))
+                sv = self.speaker_voices.get(speaker) if speaker else None
                 if sv:
                     ref_audio, ref_text = sv
                 else:
@@ -4060,6 +4062,25 @@ class MainWindow(QMainWindow):
 
         self._preview_audiobook_btn.setEnabled(has_done)
 
+    def _ebook_fragment_silence_arrays(
+        self, frag: Dict, audio: np.ndarray, sr: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        pre_ms = int(frag.get('pre_silence_ms') or 0)
+        pre_arr = (
+            np.zeros(int(sr * pre_ms / 1000), dtype=np.float32)
+            if pre_ms > 0 else np.zeros(0, dtype=np.float32)
+        )
+
+        post_arr = np.zeros(0, dtype=np.float32)
+        target_ms = frag.get('target_duration_ms')
+        if target_ms is not None:
+            audio_dur_ms = int(round(len(audio) / sr * 1000))
+            extra_ms = max(0, int(target_ms) - audio_dur_ms)
+            if extra_ms > 0:
+                post_arr = np.zeros(int(sr * extra_ms / 1000), dtype=np.float32)
+
+        return pre_arr, post_arr
+
     def _preview_selected_fragments(self):
         if not hasattr(self, '_ebook_chapter_item') or not self._ebook_chapter_item:
             return
@@ -4181,15 +4202,12 @@ class MainWindow(QMainWindow):
                     tensor = TAF.resample(tensor, sr, target_sr)
                     audio  = np.ascontiguousarray(tensor.squeeze(0).numpy(), dtype=np.float32)
 
-                target_ms = frag.get('target_duration_ms')
-                if target_ms is not None:
-                    audio_dur_ms = int(round(len(audio) / target_sr * 1000))
-                    extra_ms     = max(0, int(target_ms) - audio_dur_ms)
-                    if extra_ms > 0:
-                        extra_sil = np.zeros(int(target_sr * extra_ms / 1000), dtype=np.float32)
-                        audio     = np.concatenate([audio, extra_sil])
-
+                pre_arr, post_arr = self._ebook_fragment_silence_arrays(frag, audio, target_sr)
+                if len(pre_arr):
+                    parts.append(pre_arr)
                 parts.append(audio)
+                if len(post_arr):
+                    parts.append(post_arr)
                 if silence_ms > 0:
                     parts.append(global_silence.copy())
             except Exception as e:
@@ -4281,10 +4299,19 @@ class MainWindow(QMainWindow):
                 if audio.ndim > 1:
                     audio = audio.mean(axis=1)
                 if frag_sr != sr:
-                    audio = torchaudio.functional.resample(
-                        torch.from_numpy(audio), frag_sr, sr
-                    ).numpy()
+                    audio = np.ascontiguousarray(
+                        torchaudio.functional.resample(
+                            torch.from_numpy(audio), frag_sr, sr
+                        ).numpy(),
+                        dtype=np.float32,
+                    )
+
+                pre_arr, post_arr = self._ebook_fragment_silence_arrays(frag, audio, sr)
+                if len(pre_arr):
+                    all_audio.append(pre_arr)
                 all_audio.append(audio)
+                if len(post_arr):
+                    all_audio.append(post_arr)
 
                 if i < len(done_frags) - 1 and silence_ms > 0:
                     silence = np.zeros(int(sr * silence_ms / 1000), dtype=np.float32)
@@ -4735,6 +4762,7 @@ class MainWindow(QMainWindow):
             or model_id == "voxcpm2-voicedesign"
             or model_id == "voxcpm2-voiceclone"
             or model_id.startswith("supertonic_")
+            or model_id == "piper"
         )
         if hasattr(self, "_whisper_ref_text_label"):
             self._whisper_ref_text_label.setVisible(not hide_ref_text)
@@ -4773,15 +4801,23 @@ class MainWindow(QMainWindow):
         model_id = self._model_combo.currentData()
         return model_id is not None and model_id.startswith("supertonic_")
 
+    def _is_piper_active(self) -> bool:
+        if not hasattr(self, "_model_combo"):
+            return False
+        model_id = self._model_combo.currentData()
+        return model_id == "piper"
+
     def _update_voice_section_for_model(self, model_id: str):
         if not hasattr(self, "_omnivoice_mode_widget"):
             return
-        is_ov = model_id.startswith("omnivoice_")
+        is_ov         = model_id.startswith("omnivoice_")
         is_supertonic = model_id.startswith("supertonic_")
+        is_piper      = model_id == "piper"
+        is_no_clone   = is_supertonic or is_piper
 
         self._omnivoice_mode_widget.setVisible(is_ov)
         if hasattr(self, "_supertonic_single_hint"):
-            self._supertonic_single_hint.setVisible(is_supertonic and not is_ov)
+            self._supertonic_single_hint.setVisible(is_no_clone and not is_ov)
 
         if is_ov:
             self._on_voice_mode_changed()
@@ -4793,14 +4829,14 @@ class MainWindow(QMainWindow):
                 "qwen3-customvoice-0.6b",
             )
 
-            hide_audio_drop = is_qwen3_no_ref_audio or is_supertonic
+            hide_audio_drop = is_qwen3_no_ref_audio or is_no_clone
 
             for attr in ("_drop", "_ref_player", "_ref_audio_info_lbl", "_proc_section"):
                 if hasattr(self, attr):
                     getattr(self, attr).setVisible(not hide_audio_drop)
 
             self._cloning_widget.setVisible(
-                not is_voxcpm2_voicedesign and not is_supertonic
+                not is_voxcpm2_voicedesign and not is_no_clone
             )
 
             if hasattr(self, "_whisper_section_widget"):
@@ -4814,7 +4850,7 @@ class MainWindow(QMainWindow):
                     not incompatible
                     and not is_voxcpm2_voicedesign
                     and not is_qwen3_no_ref_audio
-                    and not is_supertonic
+                    and not is_no_clone
                 )
  
     def _on_voice_mode_changed(self):
@@ -5573,10 +5609,15 @@ class MainWindow(QMainWindow):
             if dur is not None:
                 dur_ms = int(dur * 1000)
                 target_ms = frag.get('target_duration_ms')
+                pre_ms = int(frag.get('pre_silence_ms') or 0)
                 timing_txt = _fmt_ms(dur_ms)
-                if target_ms and target_ms > dur_ms:
+                has_extra = bool(target_ms and target_ms > dur_ms)
+                if has_extra:
                     extra_ms = target_ms - dur_ms
                     timing_txt += f" +{extra_ms} ms"
+                if pre_ms > 0:
+                    timing_txt = f"+{pre_ms} ms, " + timing_txt
+                if has_extra or pre_ms > 0:
                     item.setForeground(COL_TIMING, QColor(C["accent"]))
                 else:
                     item.setForeground(COL_TIMING, QColor("#55bb55"))
@@ -5621,10 +5662,15 @@ class MainWindow(QMainWindow):
             if dur is not None:
                 dur_ms     = int(dur * 1000)
                 target_ms  = frag.get('target_duration_ms')
+                pre_ms     = int(frag.get('pre_silence_ms') or 0)
                 timing_txt = _fmt_ms(dur_ms)
-                if target_ms and target_ms > dur_ms:
+                has_extra  = bool(target_ms and target_ms > dur_ms)
+                if has_extra:
                     extra_ms    = target_ms - dur_ms
                     timing_txt += f"  +{extra_ms} ms"
+                if pre_ms > 0:
+                    timing_txt = f"+{pre_ms} ms, " + timing_txt
+                if has_extra or pre_ms > 0:
                     item.setForeground(COL_TIMING, QColor(C["accent"]))
                 else:
                     item.setForeground(COL_TIMING, QColor("#55bb55"))
@@ -5976,7 +6022,7 @@ class MainWindow(QMainWindow):
         act_dur = menu.addAction("⏱  Edit duration / add silence")
         act_dur.setEnabled(has_audio)
         act_dur.setToolTip(
-            "Add extra silence after this fragment during export/preview.\n"
+            "Add extra silence before and/or after this fragment during export/preview.\n"
             "Cannot set duration shorter than the actual audio."
         )
         act_dur.triggered.connect(lambda: self._edit_ebook_fragment_timing(frag))
@@ -5991,6 +6037,9 @@ class MainWindow(QMainWindow):
         if speaker:
             act_clr = menu.addAction("✕  Remove speaker")
             act_clr.triggered.connect(lambda: self._edit_ebook_speaker(frag, clear=True))
+
+        act_spk_sel = menu.addAction("✏️  Set speaker for selected")
+        act_spk_sel.triggered.connect(self._set_speaker_for_selected_ebook)
 
         menu.addSeparator()
 
@@ -6084,6 +6133,51 @@ class MainWindow(QMainWindow):
             self._update_ebook_tree_item(frag['index'])
             self._sync_ebook_speaker_ui()
  
+    def _set_speaker_for_selected_ebook(self):
+        if not self._ebook_fragments or not self._ebook_chapter_item:
+            return
+
+        checked_indices: set = set()
+        for i in range(self._ebook_chapter_item.childCount()):
+            child = self._ebook_chapter_item.child(i)
+            if (not child.isHidden()
+                    and child.checkState(COL_STATUS) == Qt.CheckState.Checked):
+                idx = child.data(COL_STATUS, Qt.ItemDataRole.UserRole)
+                if idx is not None:
+                    checked_indices.add(idx)
+
+        if not checked_indices:
+            QMessageBox.information(
+                self, "Nothing selected",
+                "No fragments are checked.\nCheck at least one fragment first."
+            )
+            return
+
+        checked_frags = [f for f in self._ebook_fragments if f['index'] in checked_indices]
+        current = checked_frags[0].get('speaker') or ""
+
+        name, ok = QInputDialog.getText(
+            self,
+            "Speaker name",
+            f"Set speaker for {len(checked_frags)} selected fragment(s)\n"
+            "(leave empty to clear / use default voice):",
+            text=current,
+        )
+        if not ok:
+            return
+
+        new_speaker = name.strip() or None
+        for frag in checked_frags:
+            frag['speaker'] = new_speaker
+            self._update_ebook_tree_item(frag['index'])
+
+        self._sync_ebook_speaker_ui()
+        self._set_status(
+            f"Speaker {'set to ' + new_speaker if new_speaker else 'cleared'} "
+            f"for {len(checked_frags)} fragment(s).",
+            C["accent"],
+        )
+ 
     def _edit_ebook_fragment_timing(self, frag: Dict):
         path = frag.get('output_path')
         if not path or not os.path.exists(path):
@@ -6101,10 +6195,11 @@ class MainWindow(QMainWindow):
         audio_dur_ms     = int(audio_dur_s * 1000)
         current_target   = frag.get('target_duration_ms', audio_dur_ms)
         current_extra_ms = max(0, current_target - audio_dur_ms)
+        current_pre_ms   = int(frag.get('pre_silence_ms') or 0)
 
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Edit duration — fragment #{frag['index'] + 1}")
-        dlg.resize(400, 200)
+        dlg.resize(400, 230)
         dlg.setStyleSheet(self.styleSheet())
 
         lay = QVBoxLayout(dlg)
@@ -6114,6 +6209,23 @@ class MainWindow(QMainWindow):
         audio_lbl = QLabel(f"Audio duration:  {_fmt_ms(audio_dur_ms)}")
         audio_lbl.setStyleSheet(f"color:{C['text2']};font-size:12px;")
         lay.addWidget(audio_lbl)
+
+        pre_row = QHBoxLayout()
+        pre_lbl = QLabel("Extra silence before (ms):")
+        pre_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
+        pre_spin = QSpinBox()
+        pre_spin.setRange(0, 120000)
+        pre_spin.setValue(current_pre_ms)
+        pre_spin.setSingleStep(100)
+        pre_spin.setMinimumWidth(110)
+        pre_spin.setToolTip(
+            "Extra silence inserted before this fragment during audiobook export and preview.\n"
+            "Useful for pauses before a new paragraph, title or chapter heading."
+        )
+        pre_row.addWidget(pre_lbl)
+        pre_row.addWidget(pre_spin)
+        pre_row.addStretch()
+        lay.addLayout(pre_row)
 
         sil_row = QHBoxLayout()
         sil_lbl = QLabel("Extra silence after (ms):")
@@ -6132,16 +6244,22 @@ class MainWindow(QMainWindow):
         sil_row.addStretch()
         lay.addLayout(sil_row)
 
-        total_lbl = QLabel(f"Total duration:  {_fmt_ms(audio_dur_ms + current_extra_ms)}")
+        total_lbl = QLabel(
+            f"Total duration:  {_fmt_ms(current_pre_ms + audio_dur_ms + current_extra_ms)}"
+        )
         total_lbl.setStyleSheet(f"color:{C['accent']};font-size:11px;font-weight:600;")
         lay.addWidget(total_lbl)
 
-        sil_spin.valueChanged.connect(
-            lambda v: total_lbl.setText(f"Total duration:  {_fmt_ms(audio_dur_ms + v)}")
-        )
+        def _update_total_lbl():
+            total_lbl.setText(
+                f"Total duration:  {_fmt_ms(pre_spin.value() + audio_dur_ms + sil_spin.value())}"
+            )
+
+        sil_spin.valueChanged.connect(lambda _v: _update_total_lbl())
+        pre_spin.valueChanged.connect(lambda _v: _update_total_lbl())
 
         hint = QLabel(
-            "Extra silence is added after this fragment during audiobook export/preview,\n"
+            "Silence before/after is added during audiobook export/preview,\n"
             "in addition to the global 'Silence between fragments' setting."
         )
         hint.setWordWrap(True)
@@ -6158,6 +6276,12 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
+        pre_ms = pre_spin.value()
+        if pre_ms <= 0:
+            frag.pop('pre_silence_ms', None)
+        else:
+            frag['pre_silence_ms'] = pre_ms
+
         extra_ms = sil_spin.value()
         if extra_ms <= 0:
             frag.pop('target_duration_ms', None)
@@ -6167,7 +6291,7 @@ class MainWindow(QMainWindow):
         self._update_ebook_tree_item(frag['index'])
         self._set_status(
             f"Fragment #{frag['index'] + 1} — audio: {_fmt_ms(audio_dur_ms)}, "
-            f"extra silence: {extra_ms} ms.",
+            f"silence before: {pre_ms} ms, silence after: {extra_ms} ms.",
             C["accent"],
         )
  
@@ -7751,6 +7875,9 @@ class MainWindow(QMainWindow):
             act_clr = menu.addAction("✕  Remove speaker")
             act_clr.triggered.connect(lambda: self._edit_speaker(frag, clear=True))
 
+        act_spk_sel = menu.addAction("✏️  Set speaker for selected")
+        act_spk_sel.triggered.connect(self._set_speaker_for_selected)
+
         menu.addSeparator()
 
         pos_in_list = next(
@@ -8049,6 +8176,51 @@ class MainWindow(QMainWindow):
             frag['speaker'] = name.strip() or None
             self._update_tree_item(frag['index'])
             self._sync_speaker_ui_from_fragments()
+
+    def _set_speaker_for_selected(self):
+        if not self._fragments or not self._chapter_item:
+            return
+
+        checked_indices: set = set()
+        for i in range(self._chapter_item.childCount()):
+            child = self._chapter_item.child(i)
+            if (not child.isHidden()
+                    and child.checkState(COL_STATUS) == Qt.CheckState.Checked):
+                idx = child.data(COL_STATUS, Qt.ItemDataRole.UserRole)
+                if idx is not None:
+                    checked_indices.add(idx)
+
+        if not checked_indices:
+            QMessageBox.information(
+                self, "Nothing selected",
+                "No fragments are checked.\nCheck at least one fragment first."
+            )
+            return
+
+        checked_frags = [f for f in self._fragments if f['index'] in checked_indices]
+        current = checked_frags[0].get('speaker') or ""
+
+        name, ok = QInputDialog.getText(
+            self,
+            "Speaker name",
+            f"Set speaker for {len(checked_frags)} selected fragment(s)\n"
+            "(leave empty to clear / use default voice):",
+            text=current,
+        )
+        if not ok:
+            return
+
+        new_speaker = name.strip() or None
+        for frag in checked_frags:
+            frag['speaker'] = new_speaker
+            self._update_tree_item(frag['index'])
+
+        self._sync_speaker_ui_from_fragments()
+        self._set_status(
+            f"Speaker {'set to ' + new_speaker if new_speaker else 'cleared'} "
+            f"for {len(checked_frags)} fragment(s).",
+            C["accent"],
+        )
 
     def _sync_speaker_ui_from_fragments(self):
         if self._dubbing_video_path:
@@ -9381,8 +9553,9 @@ class MainWindow(QMainWindow):
             key=lambda s: freq.get(s, 0),
             reverse=True,
         )
- 
+
         is_supertonic = self._is_supertonic_active()
+        is_piper      = self._is_piper_active()
         speaker_voices_data = {}
         for spk in sorted_speaker_list:
             sv = self._speaker_voices.get(spk, {})
@@ -9390,6 +9563,11 @@ class MainWindow(QMainWindow):
                 voice_combo = sv.get("voice_combo")
                 speaker_voices_data[spk] = {
                     "voice_name": voice_combo.currentData() if voice_combo else "M1",
+                }
+            elif is_piper:
+                voice_combo = sv.get("voice_combo")
+                speaker_voices_data[spk] = {
+                    "voice_model": voice_combo.currentData() if voice_combo else "",
                 }
             else:
                 drop         = sv.get("drop")
@@ -9402,7 +9580,7 @@ class MainWindow(QMainWindow):
                     "ref_text":   ref_text_wdg.toPlainText() if ref_text_wdg else "",
                     "demucs":     demucs_chk.isChecked() if demucs_chk else False,
                 }
- 
+
         ref_audio = self._drop.file_path
         return {
             "version":              3,
@@ -9563,16 +9741,25 @@ class MainWindow(QMainWindow):
                 and self._whisper_backend.is_downloaded(self._w_size.currentData())
             )
             is_supertonic = self._is_supertonic_active()
+            is_piper      = self._is_piper_active()
             for spk, sv_data in speaker_voices_data.items():
                 sv = self._speaker_voices.get(spk)
                 if not sv:
                     continue
                 if is_supertonic:
-                    voice_name = sv_data.get("voice_name", "M1")
+                    voice_name  = sv_data.get("voice_name", "M1")
                     voice_combo = sv.get("voice_combo")
                     if voice_combo:
                         for i in range(voice_combo.count()):
                             if voice_combo.itemData(i) == voice_name:
+                                voice_combo.setCurrentIndex(i)
+                                break
+                elif is_piper:
+                    voice_model = sv_data.get("voice_model", "")
+                    voice_combo = sv.get("voice_combo")
+                    if voice_combo and voice_model:
+                        for i in range(voice_combo.count()):
+                            if voice_combo.itemData(i) == voice_model:
                                 voice_combo.setCurrentIndex(i)
                                 break
                 else:
@@ -10081,6 +10268,7 @@ class MainWindow(QMainWindow):
 
         self._speaker_voices.clear()
         is_supertonic = self._is_supertonic_active()
+        is_piper      = self._is_piper_active()
 
         for spk in self._speaker_list:
             spk_group = QGroupBox(f"🎤  {spk}")
@@ -10129,6 +10317,31 @@ class MainWindow(QMainWindow):
                 spk_lay.addWidget(hint_lbl)
 
                 self._speaker_voices[spk] = {"voice_combo": voice_combo}
+
+            elif is_piper:
+                voice_row = QHBoxLayout()
+                voice_row.setSpacing(8)
+                voice_lbl = QLabel("Voice:")
+                voice_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
+                voice_lbl.setFixedWidth(44)
+                voice_combo = QComboBox()
+                piper_opts = _piper_voice_options()
+                for vcode, vdisplay in piper_opts:
+                    voice_combo.addItem(vdisplay, vcode)
+                if piper_opts:
+                    voice_combo.setCurrentIndex(0)
+                voice_row.addWidget(voice_lbl)
+                voice_row.addWidget(voice_combo, 1)
+                spk_lay.addLayout(voice_row)
+
+                hint_lbl = QLabel("Other generation settings (speed, variation) are set globally.")
+                hint_lbl.setStyleSheet(
+                    f"color:{C['text3']};font-size:10px;font-style:italic;"
+                )
+                spk_lay.addWidget(hint_lbl)
+
+                self._speaker_voices[spk] = {"voice_combo": voice_combo}
+
             else:
                 tab_widget = QTabWidget()
                 tab_widget.setStyleSheet("""
@@ -10200,42 +10413,6 @@ class MainWindow(QMainWindow):
                 clone_lay.addWidget(rt_lbl)
                 clone_lay.addWidget(ref_text)
 
-                w_row = QHBoxLayout()
-                w_row.setSpacing(6)
-                wm_lbl = QLabel("Model:")
-                wm_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
-                wm_lbl.setFixedWidth(44)
-                w_size = QComboBox()
-                for sz in WHISPER_SIZES:
-                    w_size.addItem(f"{sz}  {WHISPER_SIZE_MB[sz]}", sz)
-                w_size.setCurrentIndex(self._w_size.currentIndex())
-                wl_lbl = QLabel("Language:")
-                wl_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
-                wl_lbl.setFixedWidth(58)
-                w_lang = QComboBox()
-                for code, name in WHISPER_LANGS:
-                    w_lang.addItem(name, code)
-                w_lang.setCurrentIndex(self._w_lang.currentIndex())
-                w_row.addWidget(wm_lbl)
-                w_row.addWidget(w_size)
-                w_row.addSpacing(4)
-                w_row.addWidget(wl_lbl)
-                w_row.addWidget(w_lang)
-                clone_lay.addLayout(w_row)
-
-                tr_row = QHBoxLayout()
-                tr_row.setSpacing(6)
-                tr_btn = QPushButton("🎤  Transcribe (Whisper)")
-                tr_btn.setFixedHeight(26)
-                tr_btn.setEnabled(False)
-                tr_btn.setStyleSheet(_btn(C["whisper"]))
-                tr_btn.clicked.connect(
-                    lambda _, s=spk: self._transcribe_speaker_ref(s)
-                )
-                tr_row.addWidget(tr_btn)
-                tr_row.addStretch()
-                clone_lay.addLayout(tr_row)
-
                 tab_widget.addTab(clone_tab, "🎙 Voice Cloning")
 
                 proc_tab = QWidget()
@@ -10244,58 +10421,88 @@ class MainWindow(QMainWindow):
                 proc_lay.setContentsMargins(6, 6, 6, 6)
                 proc_lay.setSpacing(6)
 
-                mono_check = QCheckBox("Convert to mono")
-                mono_check.setChecked(False)
-                proc_lay.addWidget(mono_check)
-
-                demucs_chk = QCheckBox("Vocal isolation")
-                demucs_chk.setChecked(False)
-                demucs_chk.setToolTip(
-                    "Run vocal isolation on this reference audio to isolate the voice."
+                w_size_row = QHBoxLayout()
+                w_size_lbl = QLabel("Whisper size:")
+                w_size_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
+                w_size_lbl.setFixedWidth(100)
+                w_size = QComboBox()
+                for s in WHISPER_SIZES:
+                    w_size.addItem(f"{s}  ({WHISPER_SIZE_MB.get(s, '')})", s)
+                w_size.setCurrentIndex(
+                    WHISPER_SIZES.index(self._w_size.currentData())
+                    if self._w_size.currentData() in WHISPER_SIZES else 0
                 )
-                demucs_chk.toggled.connect(
-                    lambda checked, c=demucs_chk: self._on_speaker_demucs_toggled(checked, c)
-                )
-                proc_lay.addWidget(demucs_chk)
+                w_size_row.addWidget(w_size_lbl)
+                w_size_row.addWidget(w_size, 1)
+                proc_lay.addLayout(w_size_row)
 
-                bd_row = QHBoxLayout()
-                bd_row.setSpacing(8)
-                chk_bit_depth = QCheckBox("Output bit depth:")
-                chk_bit_depth.setChecked(False)
+                w_lang_row = QHBoxLayout()
+                w_lang_lbl = QLabel("Transcription language:")
+                w_lang_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
+                w_lang_lbl.setFixedWidth(100)
+                w_lang = QComboBox()
+                for code, label in WHISPER_LANGS:
+                    w_lang.addItem(label, code)
+                w_lang_row.addWidget(w_lang_lbl)
+                w_lang_row.addWidget(w_lang, 1)
+                proc_lay.addLayout(w_lang_row)
+
+                mono_check  = QCheckBox("Convert to mono")
+                mono_check.setChecked(self._mono_check.isChecked())
+                sr_combo    = QComboBox()
+                for val, label in TARGET_SR_OPTIONS:
+                    sr_combo.addItem(label, val)
+                for i in range(sr_combo.count()):
+                    if sr_combo.itemData(i) == self._sr_combo.currentData():
+                        sr_combo.setCurrentIndex(i)
+                        break
+
+                chk_bit_depth   = QCheckBox("Override bit depth")
+                chk_bit_depth.setChecked(self._chk_bit_depth.isChecked())
                 bit_depth_combo = QComboBox()
-                bit_depth_combo.addItem("16-bit", "PCM_16")
-                bit_depth_combo.addItem("24-bit", "PCM_24")
-                bit_depth_combo.addItem("32-bit float", "FLOAT")
-                bit_depth_combo.setCurrentIndex(0)
-                bit_depth_combo.setEnabled(False)
-                chk_bit_depth.toggled.connect(
-                    lambda checked, c=bit_depth_combo: c.setEnabled(checked)
-                )
-                bd_row.addWidget(chk_bit_depth)
-                bd_row.addWidget(bit_depth_combo)
-                bd_row.addStretch()
-                proc_lay.addLayout(bd_row)
+                for code, label in [("PCM_16","16-bit"),("PCM_24","24-bit"),("FLOAT","32-bit float")]:
+                    bit_depth_combo.addItem(label, code)
+                for i in range(bit_depth_combo.count()):
+                    if bit_depth_combo.itemData(i) == self._bit_depth_combo.currentData():
+                        bit_depth_combo.setCurrentIndex(i)
+                        break
 
                 sr_row = QHBoxLayout()
-                sr_row.setSpacing(6)
-                sr_lbl = QLabel("Sample rate:")
+                sr_lbl = QLabel("Target sample rate:")
                 sr_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
-                sr_combo = QComboBox()
-                for val, name in TARGET_SR_OPTIONS:
-                    sr_combo.addItem(name, val)
-                sr_combo.setCurrentIndex(self._sr_combo.currentIndex())
+                sr_lbl.setFixedWidth(100)
                 sr_row.addWidget(sr_lbl)
-                sr_row.addWidget(sr_combo)
-                sr_row.addStretch()
-                proc_lay.addLayout(sr_row)
+                sr_row.addWidget(sr_combo, 1)
+
+                demucs_chk = QCheckBox("Isolate vocals (Demucs)")
+                demucs_chk.setToolTip(
+                    "Run Demucs source separation to strip background noise / music "
+                    "from the reference audio before cloning."
+                )
 
                 proc_btn = QPushButton("🔧  Process audio")
-                proc_btn.setFixedHeight(26)
+                proc_btn.setFixedHeight(28)
                 proc_btn.setEnabled(False)
                 proc_btn.setStyleSheet(_btn(C["proc"]))
-                proc_btn.clicked.connect(lambda _, s=spk: self._process_speaker_audio(s))
+                proc_btn.clicked.connect(
+                    lambda _, s=spk: self._process_speaker_audio(s)
+                )
+
+                tr_btn = QPushButton("🎤  Transcribe (Whisper)")
+                tr_btn.setFixedHeight(28)
+                tr_btn.setEnabled(False)
+                tr_btn.setStyleSheet(_btn(C["whisper"]))
+                tr_btn.clicked.connect(
+                    lambda _, s=spk: self._transcribe_speaker_ref(s)
+                )
+
+                proc_lay.addWidget(mono_check)
+                proc_lay.addLayout(sr_row)
+                proc_lay.addWidget(chk_bit_depth)
+                proc_lay.addWidget(bit_depth_combo)
+                proc_lay.addWidget(demucs_chk)
                 proc_lay.addWidget(proc_btn)
-                proc_lay.addStretch()
+                proc_lay.addWidget(tr_btn)
 
                 tab_widget.addTab(proc_tab, "🔧 Prepare Audio")
 
@@ -10331,21 +10538,26 @@ class MainWindow(QMainWindow):
     def _get_speaker_voices_dict(self) -> Optional[Dict]:
         if not self._dubbing_mode or not self._speaker_list:
             return None
-        result = {}
+        result        = {}
         is_supertonic = self._is_supertonic_active()
+        is_piper      = self._is_piper_active()
         for spk in self._speaker_list:
             sv = self._speaker_voices.get(spk, {})
             if is_supertonic:
                 voice_combo = sv.get("voice_combo")
-                voice_name = voice_combo.currentData() if voice_combo else "M1"
+                voice_name  = voice_combo.currentData() if voice_combo else "M1"
                 result[spk] = (None, voice_name)
+            elif is_piper:
+                voice_combo  = sv.get("voice_combo")
+                voice_model  = voice_combo.currentData() if voice_combo else ""
+                result[spk]  = (None, voice_model)
             else:
                 drop         = sv.get("drop")
                 ref_text_wdg = sv.get("ref_text")
                 audio_path   = drop.file_path if drop else None
                 text         = ref_text_wdg.toPlainText().strip() if ref_text_wdg else None
                 result[spk]  = (audio_path, text or None)
-        if is_supertonic:
+        if is_supertonic or is_piper:
             return result if result else None
         has_any_audio = any(v[0] for v in result.values())
         return result if has_any_audio else None
