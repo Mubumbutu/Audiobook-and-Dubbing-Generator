@@ -359,6 +359,7 @@ class _MossTTSBase(TTSBackend):
         audio_repetition_penalty: float = 1.0,
         max_new_tokens: int = 4096,
         target_tokens: int = 0,
+        language: Optional[str] = None,
         progress_cb: Optional[Callable] = None,
         **kwargs,
     ) -> Tuple[np.ndarray, int]:
@@ -380,6 +381,8 @@ class _MossTTSBase(TTSBackend):
                 msg_kwargs["reference"] = [reference_audio_path]
             if target_tokens and target_tokens > 0:
                 msg_kwargs["tokens"] = int(target_tokens)
+            if language and str(language).strip():
+                msg_kwargs["language"] = str(language).strip()
 
             conversation = [self._processor.build_user_message(**msg_kwargs)]
             batch        = self._processor([conversation], mode="generation")
@@ -509,3 +512,138 @@ class MossTTSLocal17BBackend(_MossTTSBase):
     @property
     def generation_params(self) -> List[Dict[str, Any]]:
         return _MOSS_PARAMS_17B
+
+_MOSS_PARAMS_15: List[Dict[str, Any]] = [
+    {
+        "key":     "audio_temperature",
+        "type":    "slider",
+        "label":   "Audio Temperature",
+        "min":     0.1,
+        "max":     3.0,
+        "default": 1.0,
+        "tip":     "Higher = more expressive variation; lower = more stable delivery",
+    },
+    {
+        "key":     "audio_top_p",
+        "type":    "slider",
+        "label":   "Audio Top-P",
+        "min":     0.1,
+        "max":     1.0,
+        "default": 0.95,
+        "tip":     "Nucleus sampling cutoff; lower = more conservative",
+    },
+    {
+        "key":     "audio_top_k",
+        "type":    "spinbox",
+        "label":   "Audio Top-K",
+        "min":     1,
+        "max":     500,
+        "default": 50,
+        "step":    5,
+        "tip":     "Top-K sampling; lower = tighter token distribution",
+    },
+    {
+        "key":     "audio_repetition_penalty",
+        "type":    "slider",
+        "label":   "Rep. Penalty",
+        "min":     0.5,
+        "max":     2.0,
+        "default": 1.0,
+        "tip":     ">1.0 discourages repeating token patterns",
+    },
+    {
+        "key":     "max_new_tokens",
+        "type":    "spinbox",
+        "label":   "Max New Tokens",
+        "min":     512,
+        "max":     32768,
+        "default": 4096,
+        "step":    512,
+        "tip":     "Maximum audio tokens to generate (higher = longer audio allowed)",
+    },
+    {
+        "key":     "target_tokens",
+        "type":    "spinbox",
+        "label":   "Target Tokens (0=off)",
+        "min":     0,
+        "max":     45000,
+        "default": 0,
+        "step":    50,
+        "tip":     "Duration control: ~12.5 tokens/second. 0 = disabled",
+    },
+    {
+        "key":     "language",
+        "type":    "combo",
+        "label":   "Language",
+        "default": "",
+        "options": [
+            ("",    "Auto-detect"),
+            ("zh",  "Chinese"),
+            ("yue", "Cantonese"),
+            ("en",  "English"),
+            ("ar",  "Arabic"),
+            ("cs",  "Czech"),
+            ("da",  "Danish"),
+            ("nl",  "Dutch"),
+            ("fi",  "Finnish"),
+            ("fr",  "French"),
+            ("de",  "German"),
+            ("el",  "Greek"),
+            ("he",  "Hebrew"),
+            ("hi",  "Hindi"),
+            ("hu",  "Hungarian"),
+            ("it",  "Italian"),
+            ("ja",  "Japanese"),
+            ("ko",  "Korean"),
+            ("mk",  "Macedonian"),
+            ("ms",  "Malay"),
+            ("fa",  "Persian"),
+            ("pl",  "Polish"),
+            ("pt",  "Portuguese"),
+            ("ro",  "Romanian"),
+            ("ru",  "Russian"),
+            ("es",  "Spanish"),
+            ("sw",  "Swahili"),
+            ("sv",  "Swedish"),
+            ("tl",  "Tagalog"),
+            ("th",  "Thai"),
+            ("tr",  "Turkish"),
+            ("vi",  "Vietnamese"),
+        ],
+        "tip":     "Language tag for v1.5 — recommended for all non-Chinese/English text",
+    },
+]
+
+
+@register_backend
+class MossTTS15Backend(_MossTTSBase):
+
+    def __init__(self):
+        super().__init__(
+            _ROOT_DIR / "models" / "moss-tts-1.5",
+            _MOSS_PARAMS_15,
+        )
+
+    @property
+    def name(self) -> str:
+        return "MOSS-TTS v1.5"
+
+    @property
+    def model_id(self) -> str:
+        return "moss_tts_15"
+
+    @property
+    def display_name(self) -> str:
+        return "🌿 MOSS-TTS v1.5"
+
+    @property
+    def download_repo(self) -> str:
+        return "OpenMOSS-Team/MOSS-TTS-v1.5"
+
+    @property
+    def download_size(self) -> str:
+        return "~16 GB"
+
+    @property
+    def generation_params(self) -> List[Dict[str, Any]]:
+        return _MOSS_PARAMS_15
