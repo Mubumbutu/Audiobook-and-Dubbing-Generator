@@ -32,6 +32,8 @@ set "LABEL_venv_qwen3=Qwen3 TTS"
 set "LABEL_venv_tada=TADA TTS"
 set "LABEL_venv_voxcpm2=VoxCPM 2"
 set "LABEL_venv_supertonic=Supertonic 3"
+set "LABEL_venv_piper=Piper TTS"
+set "LABEL_venv_xttsv2=XTTS v2"
 
 set COUNT=0
 for /d %%D in ("venvs\*") do (
