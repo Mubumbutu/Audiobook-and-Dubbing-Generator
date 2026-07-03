@@ -23,9 +23,17 @@ from typing import Optional, List, Dict, Tuple, Callable
 import numpy as np
 import soundfile as sf
 import sounddevice as sd
-import torch
-import torchaudio
-import torchaudio.functional as TAF
+try:
+    import torch
+    import torchaudio
+    import torchaudio.functional as TAF
+    TORCH_AVAILABLE = True
+except ImportError as _torch_import_error:
+    torch = None
+    torchaudio = None
+    TAF = None
+    TORCH_AVAILABLE = False
+    print(f"[WARN] torch/torchaudio not available in this venv: {_torch_import_error}", file=sys.stderr)
 from huggingface_hub import snapshot_download
  
 from PyQt6.QtWidgets import (
@@ -52,24 +60,19 @@ import txt_format
 import pdf_format
 import kindle_format
 import fb2_format
-import fish_s2_pro
-import moss_backend
-import tada
-import chatterbox_backend
-import omnivoice_backend
-import qwen3_backend
-import voxcpm2_backend
-import supertonic_backend
-from supertonic_backend import SUPERTONIC_VOICES
-import piper_backend
-from piper_backend import _voice_options as _piper_voice_options
-import xttsv2_backend
+
 from input_formats import get_format
 from tts_backends import (
     SynthesisRequest, SynthesisResult,
     detect_active_backends, create_backend,
+    load_active_backend_modules, get_loaded_module,
+    InferenceError,
 )
-from fish_s2_pro import InferenceError
+
+load_active_backend_modules()
+SUPERTONIC_VOICES = getattr(get_loaded_module("supertonic_backend"), "SUPERTONIC_VOICES", [])
+_piper_voice_options = getattr(get_loaded_module("piper_backend"), "_voice_options", lambda *a, **k: [])
+
 from srt_format import _ms_to_srt_ts as _ms_to_ts
 from txt_format import txt_srt_format, txt_ebook_format
  
@@ -683,7 +686,7 @@ class TTSWorker(QThread):
 
             finally:
                 gc.collect()
-                if torch.cuda.is_available():
+                if TORCH_AVAILABLE and torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
             if self._cancelled:
@@ -738,7 +741,7 @@ class WhisperBackend:
 
     def __init__(self, model_dir: Path):
         self.model_dir = Path(model_dir)
-        self.device    = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device    = "cuda" if (TORCH_AVAILABLE and torch.cuda.is_available()) else "cpu"
 
     def model_path(self, size: str) -> Path:
         return self.model_dir / size
@@ -1016,6 +1019,20 @@ class LektorExportThread(QThread):
         self.lektor_wav_path  = lektor_wav_path
         self.extra_tmp_paths  = extra_tmp_paths or []
 
+    def _cleanup_tmp_files(self):
+        try:
+            if os.path.exists(self.lektor_wav_path):
+                os.remove(self.lektor_wav_path)
+        except Exception:
+            pass
+
+        for p in self.extra_tmp_paths:
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
     def run(self):
         try:
             result = subprocess.run(
@@ -1026,19 +1043,6 @@ class LektorExportThread(QThread):
                 for line in stderr_text.strip().splitlines()[-20:]:
                     logger.info(f"[ffmpeg] {line}")
 
-            try:
-                if os.path.exists(self.lektor_wav_path):
-                    os.remove(self.lektor_wav_path)
-            except Exception:
-                pass
-
-            for p in self.extra_tmp_paths:
-                try:
-                    if p and os.path.exists(p):
-                        os.remove(p)
-                except Exception:
-                    pass
-
             if result.returncode == 0:
                 self.finished.emit(True, "")
             else:
@@ -1047,6 +1051,8 @@ class LektorExportThread(QThread):
             self.finished.emit(False, "Timeout — operation took too long.")
         except Exception as e:
             self.finished.emit(False, str(e))
+        finally:
+            self._cleanup_tmp_files()
 
 class DubbingVocalExtractWorker(BaseWorker):
     finished = pyqtSignal(str)
@@ -1145,26 +1151,33 @@ class DubbingVocalExtractWorker(BaseWorker):
 class VocalSuppressWorker(BaseWorker):
     finished = pyqtSignal(str, str)
 
-    def __init__(self, video_path: str, output_dir: str):
+    def __init__(self, video_path: str, output_dir: str, audio_path: Optional[str] = None):
         super().__init__()
         self.video_path = video_path
         self.output_dir = output_dir
+        self.audio_path = audio_path  # zewnętrzny plik audio (jeśli podany)
 
     def run(self):
         try:
-            tmp_dir    = Path(tempfile.mkdtemp(prefix="vocal_suppress_"))
-            audio_path = str(tmp_dir / "extracted_audio.wav")
+            tmp_dir = Path(tempfile.mkdtemp(prefix="vocal_suppress_"))
 
-            self.status.emit("Vocal suppression: extracting audio from video (ffmpeg)…")
-            r = subprocess.run(
-                ["ffmpeg", "-y", "-i", self.video_path,
-                 "-ac", "2", "-ar", "44100", "-vn", audio_path],
-                capture_output=True, timeout=600,
-            )
-            if r.returncode != 0:
-                raise RuntimeError(
-                    f"ffmpeg audio extraction failed:\n{r.stderr.decode(errors='replace')[-2000:]}"
+            # Jeśli podano zewnętrzny plik audio, używamy go bezpośrednio
+            if self.audio_path and os.path.exists(self.audio_path):
+                audio_path = self.audio_path
+                self.status.emit("Vocal suppression: using external audio file…")
+            else:
+                # Ekstrakcja audio z wideo
+                audio_path = str(tmp_dir / "extracted_audio.wav")
+                self.status.emit("Vocal suppression: extracting audio from video (ffmpeg)…")
+                r = subprocess.run(
+                    ["ffmpeg", "-y", "-i", self.video_path,
+                     "-ac", "2", "-ar", "44100", "-vn", audio_path],
+                    capture_output=True, timeout=600,
                 )
+                if r.returncode != 0:
+                    raise RuntimeError(
+                        f"ffmpeg audio extraction failed:\n{r.stderr.decode(errors='replace')[-2000:]}"
+                    )
 
             self.status.emit(
                 "Vocal suppression: isolating vocals — this may take several minutes…"
@@ -1194,8 +1207,8 @@ class VocalSuppressWorker(BaseWorker):
                     f"Demucs failed:\n{r.stderr.decode(errors='replace')[-2000:]}"
                 )
 
-            stem          = Path(audio_path).stem
-            vocals_src    = Path(demucs_out_dir) / "htdemucs_ft" / stem / "vocals.wav"
+            stem = Path(audio_path).stem
+            vocals_src = Path(demucs_out_dir) / "htdemucs_ft" / stem / "vocals.wav"
             no_vocals_src = Path(demucs_out_dir) / "htdemucs_ft" / stem / "no_vocals.wav"
 
             if not vocals_src.exists():
@@ -1214,10 +1227,10 @@ class VocalSuppressWorker(BaseWorker):
                     )
                 no_vocals_src = found[0]
 
-            out_dir       = Path(self.output_dir)
+            out_dir = Path(self.output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
-            video_stem    = Path(self.video_path).stem
-            vocals_dst    = str(out_dir / f"_vsup_vocals_{video_stem}.wav")
+            video_stem = Path(self.video_path).stem
+            vocals_dst = str(out_dir / f"_vsup_vocals_{video_stem}.wav")
             no_vocals_dst = str(out_dir / f"_vsup_no_vocals_{video_stem}.wav")
 
             shutil.copy2(str(vocals_src), vocals_dst)
@@ -3659,6 +3672,7 @@ class MainWindow(QMainWindow):
             self._norm_check.setToolTip("ffmpeg not found in PATH")
         self._lektor_section.add_widget(self._norm_check)
 
+        # --- Video selection ---
         self._vid_row_widget = QWidget()
         self._vid_row_widget.setStyleSheet("background: transparent;")
         vid_row = QHBoxLayout(self._vid_row_widget)
@@ -3687,6 +3701,48 @@ class MainWindow(QMainWindow):
         vid_row.addWidget(self._vid_path_edit, 1)
         self._lektor_section.add_widget(self._vid_row_widget)
 
+        self._vid_info_lbl = QLabel("🎬 No video selected")
+        self._vid_info_lbl.setStyleSheet(f"color:{C['text3']};font-size:10px;")
+        self._lektor_section.add_widget(self._vid_info_lbl)
+
+        # --- External audio selection ---
+        self._audio_row_widget = QWidget()
+        self._audio_row_widget.setStyleSheet("background: transparent;")
+        audio_row = QHBoxLayout(self._audio_row_widget)
+        audio_row.setContentsMargins(0, 0, 0, 0)
+        audio_row.setSpacing(6)
+        self._audio_path_edit = QLineEdit()
+        self._audio_path_edit.setPlaceholderText("No external audio file selected…")
+        self._audio_path_edit.setFixedHeight(28)
+        self._audio_path_edit.setReadOnly(True)
+        self._audio_path_edit.setStyleSheet(f"""
+            QLineEdit {{
+                background: {C["surface"]};
+                border: 1px solid {C["border"]};
+                border-radius: 6px;
+                color: {C["text2"]};
+                padding: 4px 8px;
+                font-size: 11px;
+            }}
+        """)
+        btn_browse_audio = QPushButton("🎵  Select audio file")
+        btn_browse_audio.setStyleSheet(_btn(C["accent"]))
+        btn_browse_audio.setFixedHeight(28)
+        btn_browse_audio.setToolTip(
+            "Select an external audio file to use instead of the video's original audio.\n"
+            "If set, all mixing, ducking and vocal suppression will use this audio track,\n"
+            "and the video's original audio will be ignored."
+        )
+        btn_browse_audio.clicked.connect(self._browse_audio_file)
+        audio_row.addWidget(btn_browse_audio)
+        audio_row.addWidget(self._audio_path_edit, 1)
+        self._lektor_section.add_widget(self._audio_row_widget)
+
+        self._audio_info_lbl = QLabel("🎵 No external audio selected")
+        self._audio_info_lbl.setStyleSheet(f"color:{C['text3']};font-size:10px;")
+        self._lektor_section.add_widget(self._audio_info_lbl)
+
+        # --- Offset, volumes, etc. ---
         off_row = QHBoxLayout()
         off_row.setSpacing(8)
         off_lbl = QLabel("Offset (ms):")
@@ -4674,7 +4730,7 @@ class MainWindow(QMainWindow):
         self._btn_dubbing.setEnabled(visible)
 
     def _update_device_label(self):
-        if torch.cuda.is_available():
+        if TORCH_AVAILABLE and torch.cuda.is_available():
             n = torch.cuda.get_device_name(0)
             m = torch.cuda.get_device_properties(0).total_memory // (1024 ** 3)
             self._device_lbl.setText(f"  🟢 CUDA — {n} ({m}GB)")
@@ -5015,13 +5071,10 @@ class MainWindow(QMainWindow):
     def _audio_info_str(path: str) -> str:
         try:
             info = sf.info(path)
-            channels = "Mono" if info.channels == 1 else "Stereo"
+            channels = info.channels
+            ch_str = "Mono" if channels == 1 else "Stereo" if channels == 2 else f"{channels}ch"
             sr = info.samplerate
-            if sr >= 1000:
-                khz = sr / 1000
-                sr_str = f"{khz:.1f} kHz" if khz != int(khz) else f"{int(khz)} kHz"
-            else:
-                sr_str = f"{sr} Hz"
+            sr_str = f"{sr/1000:.1f} kHz" if sr >= 1000 else f"{sr} Hz"
             sub = info.subtype.upper()
             if "16" in sub:
                 bits = "16-bit"
@@ -5031,7 +5084,53 @@ class MainWindow(QMainWindow):
                 bits = "32-bit"
             else:
                 bits = sub
-            return f"{channels} • {bits} • {sr_str}"
+            dur = info.duration
+            dur_str = _fmt(dur) if dur > 0 else ""
+            # bitrate nie jest dostępne w sf.info – można by użyć ffprobe, ale to już większa robota
+            return f"{ch_str} • {bits} • {sr_str} • {dur_str}"
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _video_audio_info_str(video_path: str) -> str:
+        """Return audio stream info from a video file (ffprobe)."""
+        try:
+            cmd = [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_streams", "-show_format", "-select_streams", "a", video_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, timeout=10)
+            if result.returncode != 0:
+                return ""
+            data = json.loads(result.stdout.decode(errors="replace"))
+            streams = data.get("streams", [])
+            if not streams:
+                return "No audio stream"
+            s = streams[0]
+            codec = s.get("codec_name", "unknown").upper()
+            sr = int(s.get("sample_rate", 0))
+            sr_str = f"{sr/1000:.1f} kHz" if sr >= 1000 else f"{sr} Hz"
+            channels = s.get("channels", 0)
+            ch_str = "Mono" if channels == 1 else "Stereo" if channels == 2 else f"{channels}ch"
+            # bit depth
+            bit_depth = s.get("bits_per_raw_sample") or s.get("bits_per_sample") or ""
+            if not bit_depth and codec in ("AAC", "MP3", "AC3", "EAC3"):
+                bit_depth = "(lossy)"
+            bit_str = f"{bit_depth}" if bit_depth else ""
+            # duration from stream, fallback to format
+            duration = float(s.get("duration", 0)) or float(data.get("format", {}).get("duration", 0))
+            dur_str = _fmt(duration) if duration > 0 else ""
+            # bitrate
+            bitrate = s.get("bit_rate") or data.get("format", {}).get("bit_rate")
+            bitrate_str = ""
+            if bitrate:
+                br = int(bitrate)
+                if br > 1000:
+                    bitrate_str = f"{br/1000:.0f} kbps"
+                else:
+                    bitrate_str = f"{br} bps"
+            parts = [ch_str, bit_str, sr_str, bitrate_str, codec, dur_str]
+            return " • ".join(p for p in parts if p)
         except Exception:
             return ""
 
@@ -5043,6 +5142,14 @@ class MainWindow(QMainWindow):
         self._refresh_whisper_ui()
 
     def _on_show_video_waveform(self):
+        external_audio = self._audio_path_edit.text().strip()
+        if external_audio and os.path.exists(external_audio):
+            self._video_player.load(external_audio)
+            self._video_player.setVisible(True)
+            self._video_source_path = None  # nie używamy wideo
+            self._set_status(f"Loaded external audio: {Path(external_audio).name}", C["success"])
+            return
+
         if not self._ffmpeg_ok:
             QMessageBox.warning(self, "ffmpeg not found",
                 "This feature requires ffmpeg installed in PATH.")
@@ -5062,12 +5169,25 @@ class MainWindow(QMainWindow):
 
         self._w_vid_extract = VideoAudioExtractWorker(path)
         self._w_vid_extract.status.connect(lambda m: self._set_status(m))
+        self._w_vid_extract.finished.connect(self._on_video_audio_extracted)
+        self._w_vid_extract.error.connect(
+            lambda e: self._on_error("Video audio extraction error", e,
+                reset_fn=lambda: (
+                    self._btn_show_video_wave.setEnabled(True),
+                    self._btn_show_video_wave.setText("🎬  Show Waveform from video"),
+                    self._progress.setVisible(False),
+                ))
+        )
+        self._w_vid_extract.start()
 
     def _on_video_audio_extracted(self, wav_path: str):
         self._progress.setVisible(False)
         self._btn_show_video_wave.setEnabled(True)
         self._btn_show_video_wave.setText("🎬  Show Waveform from video")
         self._video_player.load(wav_path)
+        if self._video_source_path:
+            self._vid_path_edit.setText(self._video_source_path)
+            self._update_video_info()
         if hasattr(self, '_vid_row_widget'):
             self._vid_row_widget.setVisible(False)
         self._set_status(
@@ -6483,9 +6603,20 @@ class MainWindow(QMainWindow):
             return
 
         if result["action"] == "all":
+            removed_fragments = [f for f in self._fragments if f['index'] in checked_indices]
             self._fragments = [f for f in self._fragments if f['index'] not in checked_indices]
         else:
+            removed_fragments = [f for f in self._fragments if f['index'] == frag['index']]
             self._fragments = [f for f in self._fragments if f['index'] != frag['index']]
+
+        for f in removed_fragments:
+            p = f.get('output_path', '')
+            if p and os.path.exists(p):
+                self._file_watcher.removePath(p)
+                try:
+                    os.remove(p)
+                except Exception as e:
+                    logger.warning(f"Could not delete orphan audio {p}: {e}")
 
         for i, f in enumerate(self._fragments):
             f['index']  = i
@@ -7013,6 +7144,7 @@ class MainWindow(QMainWindow):
         for i, f in enumerate(self._ebook_fragments):
             f['index'] = i
  
+        self._rename_ebook_outputs_to_match_order()
         self._populate_ebook_tree()
         self._update_action_buttons()
  
@@ -7073,17 +7205,84 @@ class MainWindow(QMainWindow):
             return
  
         if result["action"] == "all":
+            removed_fragments = [f for f in self._ebook_fragments if f['index'] in checked_indices]
             self._ebook_fragments = [f for f in self._ebook_fragments if f['index'] not in checked_indices]
         else:
+            removed_fragments = [f for f in self._ebook_fragments if f['index'] == frag['index']]
             self._ebook_fragments = [f for f in self._ebook_fragments if f['index'] != frag['index']]
+
+        for f in removed_fragments:
+            p = f.get('output_path', '')
+            if p and os.path.exists(p):
+                self._file_watcher.removePath(p)
+                try:
+                    os.remove(p)
+                except Exception as e:
+                    logger.warning(f"Could not delete orphan audio {p}: {e}")
  
         for i, f in enumerate(self._ebook_fragments):
             f['index'] = i
- 
+
+        self._rename_ebook_outputs_to_match_order()
         self._populate_ebook_tree()
         self._update_action_buttons()
         self._set_status(f"Fragment(s) removed. {len(self._ebook_fragments)} fragments remaining.")
- 
+
+    def _rename_ebook_outputs_to_match_order(self):
+        if not self._ebook_output_dir:
+            return
+        prefix = Path(self._epub_path).stem if self._epub_path else "ebook_fragment"
+
+        to_rename = [
+            frag for frag in self._ebook_fragments
+            if frag.get('output_path') and os.path.exists(frag['output_path'])
+        ]
+        if not to_rename:
+            return
+
+        desired = {
+            frag['index']: os.path.join(
+                self._ebook_output_dir, f"{prefix}_{frag['index'] + 1:03d}.wav"
+            )
+            for frag in to_rename
+        }
+
+        if all(frag['output_path'] == desired[frag['index']] for frag in to_rename):
+            return
+
+        for frag in to_rename:
+            self._file_watcher.removePath(frag['output_path'])
+
+        temp_map = {}
+        for frag in to_rename:
+            src = frag['output_path']
+            tmp = src + '.__reorder__'
+            try:
+                os.rename(src, tmp)
+                temp_map[frag['index']] = tmp
+            except Exception as e:
+                logger.warning(f"Reorder phase 1 failed for {src}: {e}")
+                temp_map[frag['index']] = src
+
+        for frag in to_rename:
+            tmp = temp_map[frag['index']]
+            dst = desired[frag['index']]
+            if tmp == frag['output_path']:
+                continue
+            try:
+                os.rename(tmp, dst)
+                frag['output_path'] = dst
+            except Exception as e:
+                logger.warning(f"Reorder phase 2 failed {tmp} -> {dst}: {e}")
+                try:
+                    os.rename(tmp, frag['output_path'])
+                except Exception:
+                    pass
+
+        for frag in to_rename:
+            if frag.get('output_path') and os.path.exists(frag['output_path']):
+                self._file_watcher.addPath(frag['output_path'])
+
     def _move_ebook_fragment(self, frag: Dict, direction: int):
         pos = next((i for i, f in enumerate(self._ebook_fragments) if f['index'] == frag['index']), -1)
         if pos < 0:
@@ -7098,6 +7297,7 @@ class MainWindow(QMainWindow):
         for i, f in enumerate(self._ebook_fragments):
             f['index'] = i
  
+        self._rename_ebook_outputs_to_match_order()
         self._populate_ebook_tree()
  
         moved_item = self._ebook_frag_items.get(new_pos)
@@ -7261,6 +7461,8 @@ class MainWindow(QMainWindow):
 
         for i, f in enumerate(self._ebook_fragments):
             f['index'] = i
+
+        self._rename_ebook_outputs_to_match_order()
 
         if merged_audio_path and os.path.exists(merged_audio_path):
             self._file_watcher.addPath(merged_audio_path)
@@ -9030,9 +9232,9 @@ class MainWindow(QMainWindow):
         max_end_ms = max((f.get('end_ms') or f.get('start_ms', 0)) for f in done_frags)
 
         total_audio_s    = sum(_get_wav_duration(f['output_path']) or 0.0 for f in done_frags)
-        total_duration_s = max(max_end_ms / 1000.0, total_audio_s) + 10.0
+        total_duration_s = max(max_end_ms / 1000.0, total_audio_s) + abs(offset_ms) / 1000.0 + 10.0
         total_samples    = int(total_duration_s * sample_rate)
-        track            = torch.zeros(1, total_samples)
+        track            = np.zeros(total_samples, dtype=np.float32)
         cursor_sample    = 0
 
         for frag in done_frags:
@@ -9068,17 +9270,25 @@ class MainWindow(QMainWindow):
                     logger.warning(f"Fragment {audio_file} has zero amplitude, skipping")
                     continue
                 frag_audio = (frag_audio / frag_max * 0.92).astype(np.float32)
-                waveform = torch.from_numpy(frag_audio).unsqueeze(0)
+                waveform = frag_audio
                 if frag_sr != sample_rate:
-                    waveform = TAF.resample(waveform, frag_sr, sample_rate)
+                    waveform, _ = AudioPreprocessor._resample(waveform, frag_sr, sample_rate)
             except Exception as e:
                 logger.warning(f"Cannot load {audio_file}: {e}")
                 continue
 
-            length = min(waveform.shape[1], total_samples - start_sample)
-            if start_sample < total_samples and length > 0:
-                track[0, start_sample:start_sample + length] = waveform[0, :length]
-                cursor_sample = start_sample + length
+            if waveform.shape[0] == 0:
+                continue
+
+            required_samples = start_sample + waveform.shape[0]
+            if required_samples > track.shape[0]:
+                grown = np.zeros(required_samples, dtype=np.float32)
+                grown[:track.shape[0]] = track
+                track = grown
+                logger.info(f"Lektor track buffer extended to {required_samples / sample_rate:.1f}s")
+
+            track[start_sample:required_samples] = waveform
+            cursor_sample = required_samples
 
         for tmp in tmp_files:
             try:
@@ -9086,15 +9296,15 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        max_val = float(track.abs().max())
+        max_val = float(np.abs(track).max())
         logger.info(f"Lektor track peak amplitude before final normalize: {max_val:.6f}")
         if max_val == 0.0:
             logger.warning("_build_lektor_audio_track: track is completely silent — no audio was placed")
             return False
         track = track / max_val * 0.92
 
-        sf.write(output_path, track[0].numpy(), sample_rate, subtype="PCM_16")
-        logger.info(f"Lektor track saved: {output_path} ({len(done_frags)} frags, {total_duration_s:.1f}s)")
+        sf.write(output_path, track, sample_rate, subtype="PCM_16")
+        logger.info(f"Lektor track saved: {output_path} ({len(done_frags)} frags, {len(track) / sample_rate:.1f}s)")
         return True
 
     def _browse_video_file(self):
@@ -9105,214 +9315,188 @@ class MainWindow(QMainWindow):
         if path:
             _set_last_dir("video", path)
             self._vid_path_edit.setText(path)
+            self._update_video_info()
+
+    def _browse_audio_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select external audio file", _get_last_dir("audio"),
+            "Audio files (*.wav *.mp3 *.flac *.ogg *.m4a);;All files (*)"
+        )
+        if path:
+            _set_last_dir("audio", path)
+            self._audio_path_edit.setText(path)
+            self._update_audio_info()
+
+    def _update_video_info(self):
+        path = self._vid_path_edit.text().strip()
+        if not path or not os.path.exists(path):
+            self._vid_info_lbl.setText("")
+            return
+        try:
+            info = self._video_audio_info_str(path)
+            self._vid_info_lbl.setText(info)
+        except Exception:
+            self._vid_info_lbl.setText("Unknown audio format")
+
+    def _update_audio_info(self):
+        path = self._audio_path_edit.text().strip()
+        if not path or not os.path.exists(path):
+            self._audio_info_lbl.setText("")
+            return
+        try:
+            info = self._audio_info_str(path)
+            self._audio_info_lbl.setText(info)
+        except Exception:
+            self._audio_info_lbl.setText("Unknown audio format")
 
     def _normalize_ffmpeg(self, input_path: str, output_path: str) -> bool:
         try:
-            r1 = subprocess.run(
-                ["ffmpeg", "-y", "-i", input_path,
-                 "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
-                 "-f", "null", "-"],
-                capture_output=True, timeout=120,
-            )
-            stderr = r1.stderr.decode(errors="replace")
-            json_start = stderr.rfind("{")
-            json_end   = stderr.rfind("}") + 1
-            if json_start == -1:
-                raise ValueError("loudnorm: no JSON in stderr")
-            info = json.loads(stderr[json_start:json_end])
-
-            af = (
-                f"loudnorm=I=-16:TP=-1.5:LRA=11:linear=true"
-                f":measured_I={info['input_i']}"
-                f":measured_LRA={info['input_lra']}"
-                f":measured_TP={info['input_tp']}"
-                f":measured_thresh={info['input_thresh']}"
-                f":offset={info['target_offset']}"
-            )
-            r2 = subprocess.run(
-                ["ffmpeg", "-y", "-i", input_path, "-af", af, output_path],
-                capture_output=True, timeout=300,
-            )
+            cmd_detect = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-af", "volumedetect", "-f", "null", "-"
+            ]
+            result = subprocess.run(cmd_detect, capture_output=True, timeout=300)
+            stderr = result.stderr.decode(errors="replace")
+            import re
+            match = re.search(r"max_volume:\s+(-?\d+\.?\d*)\s+dB", stderr)
+            if not match:
+                shutil.copy2(input_path, output_path)
+                return True
+            max_vol_db = float(match.group(1))
+            target_db = -1.0
+            gain_db = target_db - max_vol_db
+            if abs(gain_db) < 0.1:
+                shutil.copy2(input_path, output_path)
+                return True
+            cmd_gain = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-af", f"volume={gain_db:.2f}dB",
+                output_path
+            ]
+            r2 = subprocess.run(cmd_gain, capture_output=True, timeout=300)
             return r2.returncode == 0
-        except Exception as e:
-            logger.warning(f"loudnorm two-pass failed: {e}")
+        except Exception:
+            return False
+
+    @staticmethod
+    def _video_has_audio_stream(video_path: str) -> bool:
+        try:
+            cmd = [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_streams", "-select_streams", "a", video_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, timeout=10)
+            if result.returncode != 0:
+                return False
+            data = json.loads(result.stdout.decode(errors="replace"))
+            return bool(data.get("streams", []))
+        except Exception:
             return False
 
     def _export_lektor_video(self):
         if not self._ffmpeg_ok:
-            QMessageBox.warning(self, "ffmpeg not found",
-                "Video export requires ffmpeg installed in PATH.")
+            QMessageBox.warning(self, "ffmpeg not found", "Video export requires ffmpeg installed in PATH.")
             return
 
         if self._lektor_export_thread and self._lektor_export_thread.isRunning():
-            QMessageBox.information(self, "Export in progress",
-                "Video export is already running.")
+            QMessageBox.information(self, "Export in progress", "Video export is already running.")
             return
 
-        if (self._w_vocal_suppress is not None
-                and self._w_vocal_suppress.isRunning()):
-            QMessageBox.information(self, "Processing in progress",
-                "Vocal separation is already running.")
+        external_audio_path = self._audio_path_edit.text().strip()
+        if external_audio_path and not os.path.exists(external_audio_path):
+            QMessageBox.warning(self, "External audio not found", "The selected external audio file no longer exists.")
+            return
+
+        if (self._w_vocal_suppress is not None and self._w_vocal_suppress.isRunning()):
+            QMessageBox.information(self, "Processing in progress", "Vocal separation is already running.")
             return
 
         if self._dubbing_mode and self._dubbing_video_path:
             video_path = self._dubbing_video_path
-        elif getattr(self, '_video_source_path', None) and os.path.exists(
-                self._video_source_path or ''):
+        elif getattr(self, '_video_source_path', None) and os.path.exists(self._video_source_path or ''):
             video_path = self._video_source_path
         else:
             video_path = self._vid_path_edit.text().strip()
 
         if not video_path or not os.path.exists(video_path):
-            QMessageBox.warning(self, "No video file",
-                "Select a video file in the 'Video:' field.")
+            QMessageBox.warning(self, "No video file", "Select a video file in the 'Video:' field.")
             return
 
-        done_count = sum(
-            1 for f in self._fragments
-            if f.get("status") == "done"
-            and f.get("start_ms") is not None
-            and f.get("output_path")
-            and os.path.exists(f.get("output_path", ""))
-        )
+        done_count = sum(1 for f in self._fragments if f.get("status") == "done" and f.get("start_ms") is not None)
         if done_count == 0:
-            QMessageBox.warning(self, "No audio",
-                "No SRT fragment has generated audio yet.\nRun synthesis before exporting.")
+            QMessageBox.warning(self, "No audio", "No SRT fragment has generated audio yet.\nRun synthesis before exporting.")
             return
 
         os.makedirs(self._output_dir, exist_ok=True)
-
         fmt = self._lektor_vid_fmt_combo.currentData()
-        if fmt == "auto":
-            video_ext = os.path.splitext(video_path)[1]
-        else:
-            video_ext = f".{fmt}"
+        video_ext = os.path.splitext(video_path)[1] if fmt == "auto" else f".{fmt}"
 
-        default_out = os.path.join(
-            _get_last_dir("output", self._output_dir), f"lektor_output{video_ext}"
-        )
-        out_path, _ = QFileDialog.getSaveFileName(
-            self, "Save video with lektor", default_out,
-            f"Video (*{video_ext});;All files (*)",
-        )
+        default_out = os.path.join(_get_last_dir("output", self._output_dir), f"lektor_output{video_ext}")
+        out_path, _ = QFileDialog.getSaveFileName(self, "Save video with lektor", default_out, f"Video (*{video_ext});;All files (*)")
         if not out_path:
             return
 
         _set_last_dir("output", out_path)
-
-        sample_rate         = 44100
-        offset_ms           = self._offset_spin.value()
-        lektor_wav          = os.path.join(self._output_dir, "_lektor_track_tmp.wav")
-        lektor_vol          = self._lektor_vol.value() / 100.0
-        orig_vol            = self._orig_vol.value() / 100.0
-        use_ducking         = self._duck_check.isChecked()
+        sample_rate = 44100
+        offset_ms = self._offset_spin.value()
+        lektor_wav = os.path.join(self._output_dir, "_lektor_track_tmp.wav")
+        lektor_vol = self._lektor_vol.value() / 100.0
+        orig_vol = self._orig_vol.value() / 100.0
+        use_ducking = self._duck_check.isChecked()
         keep_original_track = self._keep_original_track_check.isChecked()
         if keep_original_track:
-            _raw_lang = self._dubbed_lang_edit.text().strip().lower()
-            dubbed_lang = _raw_lang if (len(_raw_lang) == 3 and _raw_lang.isalpha()) else "und"
+            dubbed_lang = self._dubbed_lang_edit.text().strip().lower()
+            if not re.fullmatch(r"[a-z]{3}", dubbed_lang):
+                dubbed_lang = "und"
         else:
             dubbed_lang = "und"
 
         self._set_status(f"Building lektor track from {done_count} fragments…")
-        self._lektor_status.setText("Building lektor track…")
-        self._lektor_status.setStyleSheet(f"color:{C['warning']};font-size:10px;")
 
         ok = self._build_lektor_audio_track(lektor_wav, sample_rate, offset_ms)
         if not ok:
-            QMessageBox.critical(self, "Error",
-                "Could not build lektor track.\nCheck that fragments have been synthesized.")
+            QMessageBox.warning(self, "Lektor track build failed", "Could not build the lektor audio track from the synthesized fragments.")
+            self._set_status("Failed to build lektor track.", C["error"])
             return
 
         if self._norm_check.isChecked():
-            self._set_status("Normalizing lektor track…")
-            self._lektor_status.setText("Normalizing audio…")
             norm_tmp = lektor_wav.replace(".wav", "_norm.wav")
             if self._normalize_ffmpeg(lektor_wav, norm_tmp):
-                try:
-                    os.replace(norm_tmp, lektor_wav)
-                    logger.info("Lektor track normalized (two-pass loudnorm)")
-                except OSError as e:
-                    logger.warning(f"Could not replace lektor WAV after normalization: {e}")
-            else:
-                logger.warning("Lektor track normalization failed, using unnormalized track")
+                os.replace(norm_tmp, lektor_wav)
 
-        try:
-            check_data, _ = sf.read(lektor_wav, dtype="float32")
-            check_max = float(np.abs(check_data).max())
-            logger.info(f"Lektor WAV amplitude validation: max={check_max:.6f}")
-            if check_max < 0.01:
-                logger.warning(f"Lektor WAV is near-silent (max={check_max:.6f})")
-                QMessageBox.warning(self, "Warning",
-                    f"Lektor track has very low amplitude ({check_max:.4f}).\n"
-                    "Audio may be inaudible in the output video.")
-        except Exception as e:
-            logger.warning(f"Could not validate lektor WAV: {e}")
+        has_video_audio = bool(external_audio_path) or self._video_has_audio_stream(video_path)
 
-        has_video_audio = False
-        try:
-            probe = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-print_format", "json",
-                 "-show_streams", "-select_streams", "a", video_path],
-                capture_output=True, timeout=30,
-            )
-            if probe.returncode == 0:
-                info = json.loads(probe.stdout.decode(errors="replace"))
-                has_video_audio = len(info.get("streams", [])) > 0
-            else:
-                has_video_audio = True
-        except Exception as e:
-            logger.warning(f"ffprobe audio probe failed: {e} — assuming audio present")
-            has_video_audio = True
-
-        logger.info(f"Video has audio stream: {has_video_audio}")
-
-        use_vocal_suppress = (
-            self._vocal_suppress_check.isChecked()
-            and has_video_audio
-        )
-        vocal_suppress_vol = self._vocal_suppress_spin.value() / 100.0
-
-        if use_vocal_suppress:
+        if self._vocal_suppress_check.isChecked() and has_video_audio:
             self._pending_export = {
-                "video_path":          video_path,
-                "lektor_wav":          lektor_wav,
-                "out_path":            out_path,
-                "has_video_audio":     has_video_audio,
-                "lektor_vol":          lektor_vol,
-                "orig_vol":            orig_vol,
-                "use_ducking":         use_ducking,
-                "vocal_suppress_vol":  vocal_suppress_vol,
-                "keep_original_track": keep_original_track,
-                "dubbed_lang":         dubbed_lang,
+                "video_path": video_path, "lektor_wav": lektor_wav, "out_path": out_path,
+                "has_video_audio": has_video_audio, "lektor_vol": lektor_vol, "orig_vol": orig_vol,
+                "use_ducking": use_ducking, "vocal_suppress_vol": self._vocal_suppress_spin.value() / 100.0,
+                "keep_original_track": keep_original_track, "dubbed_lang": dubbed_lang,
+                "external_audio_path": external_audio_path
             }
             self._export_btn.setEnabled(False)
             self._progress.setVisible(True)
             self._progress.setRange(0, 0)
-            self._lektor_status.setText("Running Demucs vocal separation…")
-            self._lektor_status.setStyleSheet(f"color:{C['warning']};font-size:10px;")
-
-            self._w_vocal_suppress = VocalSuppressWorker(video_path, self._output_dir)
+            self._w_vocal_suppress = VocalSuppressWorker(
+                video_path, self._output_dir,
+                audio_path=external_audio_path if external_audio_path else None
+            )
             self._w_vocal_suppress.status.connect(lambda m: self._set_status(m))
             self._w_vocal_suppress.finished.connect(self._on_vocal_suppress_done)
             self._w_vocal_suppress.error.connect(
-                lambda e: self._on_error("Vocal separation error", e,
+                lambda e: self._on_error("Vocal suppression error", e,
                     reset_fn=lambda: (
-                        self._export_btn.setEnabled(self._ffmpeg_ok),
                         self._progress.setVisible(False),
-                        self._lektor_status.setText("Vocal separation failed."),
-                        self._lektor_status.setStyleSheet(
-                            f"color:{C['error']};font-size:10px;"
-                        ),
+                        self._export_btn.setEnabled(self._ffmpeg_ok),
+                        self._pending_export.clear(),
                     ))
             )
             self._w_vocal_suppress.start()
         else:
             self._do_lektor_ffmpeg_export(
-                video_path, lektor_wav, out_path,
-                has_video_audio, lektor_vol, orig_vol,
-                use_ducking,
-                keep_original_track=keep_original_track,
-                dubbed_lang=dubbed_lang,
+                video_path, lektor_wav, out_path, has_video_audio, lektor_vol, orig_vol, 
+                use_ducking, keep_original_track=keep_original_track, dubbed_lang=dubbed_lang,
+                external_audio_path=external_audio_path
             )
 
     def _do_lektor_ffmpeg_export(
@@ -9328,13 +9512,23 @@ class MainWindow(QMainWindow):
         no_vocals_wav: Optional[str] = None,
         vocal_suppress_vol: float = 0.0,
         keep_original_track: bool = False,
-        dubbed_lang: str = "pol",
+        dubbed_lang: str = "und",
+        external_audio_path: Optional[str] = None,
     ):
         use_vocal_suppress = vocals_wav is not None and no_vocals_wav is not None
         extra_tmp = [p for p in [vocals_wav, no_vocals_wav] if p]
 
+        primary_audio = external_audio_path if external_audio_path else video_path
+
+        cmd = ["ffmpeg", "-y"]
+
         if has_video_audio:
             if use_vocal_suppress:
+                cmd.extend(["-i", video_path])
+                cmd.extend(["-i", no_vocals_wav])
+                cmd.extend(["-i", vocals_wav])
+                cmd.extend(["-i", lektor_wav])
+
                 if use_ducking:
                     audio_filter = (
                         f"[1:a]volume={orig_vol:.2f}[bg];"
@@ -9343,106 +9537,92 @@ class MainWindow(QMainWindow):
                         f"[3:a]volume={lektor_vol:.2f},asplit=2[lekt1][lekt2];"
                         f"[orig_mix][lekt1]sidechaincompress="
                         f"threshold=0.025:ratio=4:attack=10:release=400[ducked];"
-                        f"[ducked][lekt2]amix=inputs=2:duration=first:normalize=0[aout]"
+                        f"[ducked][lekt2]amix=inputs=2:duration=longest:normalize=0[aout]"
                     )
                 else:
                     audio_filter = (
                         f"[1:a]volume={orig_vol:.2f}[bg];"
                         f"[2:a]volume={vocal_suppress_vol:.2f}[vox];"
                         f"[3:a]volume={lektor_vol:.2f}[lekt];"
-                        f"[bg][vox][lekt]amix=inputs=3:duration=first:normalize=0[aout]"
+                        f"[bg][vox][lekt]amix=inputs=3:duration=longest:normalize=0[aout]"
                     )
+
+                cmd.extend(["-filter_complex", audio_filter])
+                cmd.extend(["-map", "0:v:0"])
+
                 if keep_original_track:
-                    cmd = [
-                        "ffmpeg", "-y",
-                        "-i", video_path,
-                        "-i", no_vocals_wav,
-                        "-i", vocals_wav,
-                        "-i", lektor_wav,
-                        "-filter_complex", audio_filter,
-                        "-map", "0:v:0",
-                        "-map", "0:a:0",
-                        "-map", "[aout]",
+                    cmd.extend(["-i", primary_audio])
+                    cmd.extend(["-map", "4:a:0"])
+                    cmd.extend(["-map", "[aout]"])
+                    cmd.extend([
                         "-c:v", "copy",
                         "-c:a", "aac", "-b:a", "192k",
                         "-metadata:s:a:0", "title=Original",
                         "-metadata:s:a:1", "title=Dubbing",
                         "-metadata:s:a:1", f"language={dubbed_lang}",
                         "-disposition:a:0", "default",
-                        "-disposition:a:1", "0",
-                        out_path,
-                    ]
+                        "-disposition:a:1", "0"
+                    ])
                 else:
-                    cmd = [
-                        "ffmpeg", "-y",
-                        "-i", video_path,
-                        "-i", no_vocals_wav,
-                        "-i", vocals_wav,
-                        "-i", lektor_wav,
-                        "-filter_complex", audio_filter,
-                        "-map", "0:v:0",
-                        "-map", "[aout]",
+                    cmd.extend(["-map", "[aout]"])
+                    cmd.extend([
                         "-c:v", "copy",
-                        "-c:a", "aac", "-b:a", "192k",
-                        out_path,
-                    ]
+                        "-c:a", "aac", "-b:a", "192k"
+                    ])
+
             else:
+                cmd.extend(["-i", video_path])
+                cmd.extend(["-i", primary_audio])
+                cmd.extend(["-i", lektor_wav])
+
                 if use_ducking:
                     audio_filter = (
-                        f"[1:a]volume={lektor_vol:.2f},asplit=2[lekt1][lekt2];"
-                        f"[0:a]volume={orig_vol:.2f}[orig];"
+                        f"[2:a]volume={lektor_vol:.2f},asplit=2[lekt1][lekt2];"
+                        f"[1:a]volume={orig_vol:.2f}[orig];"
                         f"[orig][lekt1]sidechaincompress="
                         f"threshold=0.025:ratio=4:attack=10:release=400[ducked];"
-                        f"[ducked][lekt2]amix=inputs=2:duration=first:normalize=0[aout]"
+                        f"[ducked][lekt2]amix=inputs=2:duration=longest:normalize=0[aout]"
                     )
                 else:
                     audio_filter = (
-                        f"[0:a]volume={orig_vol:.2f}[orig];"
-                        f"[1:a]volume={lektor_vol:.2f}[lekt];"
-                        f"[orig][lekt]amix=inputs=2:duration=first:normalize=0[aout]"
+                        f"[1:a]volume={orig_vol:.2f}[orig];"
+                        f"[2:a]volume={lektor_vol:.2f}[lekt];"
+                        f"[orig][lekt]amix=inputs=2:duration=longest:normalize=0[aout]"
                     )
+
+                cmd.extend(["-filter_complex", audio_filter])
+                cmd.extend(["-map", "0:v:0"])
+
                 if keep_original_track:
-                    cmd = [
-                        "ffmpeg", "-y",
-                        "-i", video_path,
-                        "-i", lektor_wav,
-                        "-filter_complex", audio_filter,
-                        "-map", "0:v:0",
-                        "-map", "0:a:0",
-                        "-map", "[aout]",
+                    cmd.extend(["-map", "1:a:0"])
+                    cmd.extend(["-map", "[aout]"])
+                    cmd.extend([
                         "-c:v", "copy",
                         "-c:a", "aac", "-b:a", "192k",
                         "-metadata:s:a:0", "title=Original",
                         "-metadata:s:a:1", "title=Dubbing",
                         "-metadata:s:a:1", f"language={dubbed_lang}",
                         "-disposition:a:0", "default",
-                        "-disposition:a:1", "0",
-                        out_path,
-                    ]
+                        "-disposition:a:1", "0"
+                    ])
                 else:
-                    cmd = [
-                        "ffmpeg", "-y",
-                        "-i", video_path,
-                        "-i", lektor_wav,
-                        "-filter_complex", audio_filter,
-                        "-map", "0:v:0",
-                        "-map", "[aout]",
+                    cmd.extend(["-map", "[aout]"])
+                    cmd.extend([
                         "-c:v", "copy",
-                        "-c:a", "aac", "-b:a", "192k",
-                        out_path,
-                    ]
+                        "-c:a", "aac", "-b:a", "192k"
+                    ])
         else:
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", video_path,
-                "-i", lektor_wav,
+            cmd.extend(["-i", video_path])
+            cmd.extend(["-i", lektor_wav])
+            cmd.extend([
                 "-map", "0:v:0",
                 "-map", "1:a:0",
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "192k",
-                "-af", f"volume={lektor_vol:.2f}",
-                out_path,
-            ]
+                "-af", f"volume={lektor_vol:.2f}"
+            ])
+
+        cmd.append(out_path)
 
         logger.info(f"ffmpeg cmd: {' '.join(cmd)}")
         self._set_status("Exporting video with lektor track…")
@@ -9477,11 +9657,15 @@ class MainWindow(QMainWindow):
             no_vocals_wav       = no_vocals_path,
             vocal_suppress_vol  = p["vocal_suppress_vol"],
             keep_original_track = p.get("keep_original_track", False),
-            dubbed_lang         = p.get("dubbed_lang", "pol"),
+            dubbed_lang         = p.get("dubbed_lang", "und"),
+            external_audio_path = p.get("external_audio_path", None),
         )
 
     def _on_lektor_export_finished(self, success: bool, error_msg: str, out_path: str):
-        self._lektor_export_thread = None
+        if self._lektor_export_thread:
+            self._lektor_export_thread.wait()
+            self._lektor_export_thread = None
+
         self._export_btn.setEnabled(self._ffmpeg_ok)
 
         if success:
@@ -9596,6 +9780,7 @@ class MainWindow(QMainWindow):
             "whisper_lang":         self._w_lang.currentData(),
             "lektor": {
                 "video_path":          self._vid_path_edit.text().strip() or None,
+                "audio_path":          self._audio_path_edit.text().strip() or None,
                 "offset_ms":           self._offset_spin.value(),
                 "lektor_vol":          self._lektor_vol.value(),
                 "orig_vol":            self._orig_vol.value(),
@@ -9604,6 +9789,9 @@ class MainWindow(QMainWindow):
                 "ducking":             self._duck_check.isChecked(),
                 "vocal_suppress":      self._vocal_suppress_check.isChecked(),
                 "vocal_suppress_vol":  self._vocal_suppress_spin.value(),
+                "keep_original_track": self._keep_original_track_check.isChecked(),
+                "dubbed_lang":         self._dubbed_lang_edit.text().strip(),
+                "video_format":        self._lektor_vid_fmt_combo.currentData(),
             },
             "dubbing_mode":       self._dubbing_mode,
             "dubbing_video_path": self._dubbing_video_path,
@@ -9629,12 +9817,12 @@ class MainWindow(QMainWindow):
         self._srt_path   = data.get("srt_path", "")
         self._output_dir = data.get("output_dir", str(OUTPUTS_DIR))
         self._fragments  = data.get("fragments", [])
- 
+
         for f in self._fragments:
             start_ms = f.get("start_ms") or 0
             end_ms   = f.get("end_ms") or 0
             f["timestamp"] = f"{_ms_to_ts(start_ms)} --> {_ms_to_ts(end_ms)}"
- 
+
         missing = 0
         for f in self._fragments:
             if (f.get("status") == "done"
@@ -9643,7 +9831,7 @@ class MainWindow(QMainWindow):
                 f["status"]      = "waiting"
                 f["output_path"] = None
                 missing += 1
- 
+
         ref_audio  = data.get("reference_audio")
         saved_hash = data.get("reference_audio_hash")
         if ref_audio and os.path.exists(ref_audio):
@@ -9660,9 +9848,9 @@ class MainWindow(QMainWindow):
             self._set_status(
                 f"Reference audio not found: {Path(ref_audio).name}", C["warning"]
             )
- 
+
         self._ref_text.setPlainText(data.get("reference_text", ""))
- 
+
         params = data.get("generation_params", {})
         for key, value in params.items():
             widget = self._param_widgets.get(key) if hasattr(self, "_param_widgets") else None
@@ -9672,50 +9860,62 @@ class MainWindow(QMainWindow):
                 widget.setValue(int(value * 100))
             elif isinstance(widget, QSpinBox):
                 widget.setValue(int(value))
- 
+
         self._norm_check.setChecked(data.get("normalize_audio", False))
- 
+
         target_sr = data.get("target_sr")
         if target_sr is not None:
             for i in range(self._sr_combo.count()):
                 if self._sr_combo.itemData(i) == target_sr:
                     self._sr_combo.setCurrentIndex(i)
                     break
- 
+
         whisper_size = data.get("whisper_size")
         if whisper_size:
             for i in range(self._w_size.count()):
                 if self._w_size.itemData(i) == whisper_size:
                     self._w_size.setCurrentIndex(i)
                     break
- 
+
         whisper_lang = data.get("whisper_lang")
         if whisper_lang:
             for i in range(self._w_lang.count()):
                 if self._w_lang.itemData(i) == whisper_lang:
                     self._w_lang.setCurrentIndex(i)
                     break
- 
+
         lektor = data.get("lektor", {})
         vid_path = lektor.get("video_path") or ""
         self._vid_path_edit.setText(vid_path)
+        self._update_video_info()
+        ext_audio_path = lektor.get("audio_path") or ""
+        self._audio_path_edit.setText(ext_audio_path)
+        self._update_audio_info()
         self._offset_spin.setValue(lektor.get("offset_ms", 0))
         self._lektor_vol.setValue(lektor.get("lektor_vol", 100))
         self._orig_vol.setValue(lektor.get("orig_vol", 100))
-        self._autofit_check.setChecked(lektor.get("autofit", True))
+        self._autofit_check.setChecked(lektor.get("autofit", False))
         self._atempo_threshold.setValue(lektor.get("atempo_threshold", 300))
         self._duck_check.setChecked(lektor.get("ducking", False))
         self._vocal_suppress_check.setChecked(lektor.get("vocal_suppress", False))
-        self._vocal_suppress_spin.setValue(lektor.get("vocal_suppress_vol", 80))
+        self._vocal_suppress_spin.setValue(lektor.get("vocal_suppress_vol", 20))
         self._vocal_suppress_spin.setEnabled(
             lektor.get("vocal_suppress", False) and self._ffmpeg_ok
         )
- 
+        self._keep_original_track_check.setChecked(lektor.get("keep_original_track", False))
+        self._dubbed_lang_edit.setText(lektor.get("dubbed_lang", ""))
+        video_format = lektor.get("video_format")
+        if video_format is not None:
+            for i in range(self._lektor_vid_fmt_combo.count()):
+                if self._lektor_vid_fmt_combo.itemData(i) == video_format:
+                    self._lektor_vid_fmt_combo.setCurrentIndex(i)
+                    break
+
         dubbing_mode = data.get("dubbing_mode", False)
         if dubbing_mode:
             self._dubbing_mode       = True
             self._dubbing_video_path = data.get("dubbing_video_path")
- 
+
             saved_speaker_list = data.get("speaker_list", [])
             freq: Dict[str, int] = {}
             for f in self._fragments:
@@ -9723,7 +9923,7 @@ class MainWindow(QMainWindow):
                 if spk and str(spk).strip():
                     k = str(spk).strip()
                     freq[k] = freq.get(k, 0) + 1
- 
+
             if freq:
                 self._speaker_list = sorted(
                     saved_speaker_list,
@@ -9732,9 +9932,9 @@ class MainWindow(QMainWindow):
                 )
             else:
                 self._speaker_list = saved_speaker_list
- 
+
             self._rebuild_voice_cloning_for_speakers()
- 
+
             speaker_voices_data = data.get("speaker_voices", {})
             whisper_ready = (
                 self._whisper_backend is not None
@@ -9776,25 +9976,25 @@ class MainWindow(QMainWindow):
                         sv["ref_text"].setPlainText(ref_text)
                     demucs = sv_data.get("demucs", False)
                     sv["demucs_chk"].setChecked(demucs)
- 
+
             if hasattr(self, "_btn_dubbing"):
                 self._btn_dubbing.setEnabled(True)
                 self._btn_dubbing.setText("✓  Dubbing active")
                 self._btn_dubbing.setStyleSheet(_btn(C["success"]))
                 self._btn_dubbing.setVisible(True)
- 
+
             if hasattr(self, "_vid_row_widget"):
                 self._vid_row_widget.setVisible(False)
             if hasattr(self, "_whisper_section_widget"):
                 self._whisper_section_widget.setVisible(False)
         else:
             self._update_dubbing_visibility()
- 
+
         for f in self._fragments:
             ap = f.get("output_path")
             if ap and os.path.exists(ap):
                 self._file_watcher.addPath(ap)
- 
+
         fname = Path(self._srt_path).name if self._srt_path else "session"
         done  = sum(1 for f in self._fragments if f.get("status") == "done")
         self._srt_label.setText(
@@ -9808,7 +10008,7 @@ class MainWindow(QMainWindow):
         self._tabs.setCurrentIndex(0)
         self._populate_tree()
         self._update_action_buttons()
- 
+
         status_msg = f"Session loaded: {len(self._fragments)} fragments, {done} already synthesized."
         if missing:
             status_msg = f"Session loaded — {missing} audio file(s) missing on disk, reset to waiting."
