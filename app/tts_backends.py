@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
@@ -108,7 +110,18 @@ class TTSBackend(ABC):
     ) -> None: ...
 
 
+class InferenceError(Exception):
+    pass
+
+
 _BACKENDS: Dict[str, type[TTSBackend]] = {}
+_LOADED_MODULES: Dict[str, Optional[ModuleType]] = {}
+
+_NON_BACKEND_MODULES = {
+    "main", "tts_backends", "input_formats",
+    "srt_format", "epub_format", "txt_format",
+    "pdf_format", "kindle_format", "fb2_format",
+}
 
 
 def register_backend(cls: type[TTSBackend]) -> type[TTSBackend]:
@@ -121,11 +134,84 @@ def register_backend(cls: type[TTSBackend]) -> type[TTSBackend]:
     return cls
 
 
+def _current_venv_name() -> Optional[str]:
+    for candidate in (
+        os.environ.get("VIRTUAL_ENV"),
+        os.environ.get("CONDA_DEFAULT_ENV"),
+        sys.prefix if sys.prefix != sys.base_prefix else None,
+    ):
+        if candidate:
+            return Path(candidate).name.lower()
+    return None
+
+
+def _discover_all_backend_module_names() -> List[str]:
+    app_dir = Path(__file__).resolve().parent
+    names = []
+    for path in app_dir.glob("*.py"):
+        stem = path.stem
+        if stem in _NON_BACKEND_MODULES or stem.startswith("_"):
+            continue
+        names.append(stem)
+    return names
+
+
+def load_active_backend_modules() -> Dict[str, Optional[ModuleType]]:
+    if _LOADED_MODULES:
+        return _LOADED_MODULES
+
+    venv_name = _current_venv_name()
+    available_backends = _discover_all_backend_module_names()
+    candidates: List[str] = []
+
+    if venv_name:
+        stem = venv_name[5:] if venv_name.startswith("venv_") else venv_name
+        if f"{stem}_backend" in available_backends:
+            candidates.append(f"{stem}_backend")
+        if stem in available_backends:
+            candidates.append(stem)
+
+    found = False
+    for mod_name in candidates:
+        try:
+            module = importlib.import_module(mod_name)
+        except ModuleNotFoundError as e:
+            if e.name == mod_name:
+                continue
+            _LOADED_MODULES[mod_name] = None
+            found = True
+            break
+        except Exception:
+            _LOADED_MODULES[mod_name] = None
+            found = True
+            break
+        else:
+            _LOADED_MODULES[mod_name] = module
+            found = True
+            break
+
+    if not found:
+        for mod_name in available_backends:
+            try:
+                _LOADED_MODULES[mod_name] = importlib.import_module(mod_name)
+            except Exception:
+                _LOADED_MODULES[mod_name] = None
+
+    return _LOADED_MODULES
+
+
+def get_loaded_module(module_name: str) -> Optional[ModuleType]:
+    return _LOADED_MODULES.get(module_name)
+
+
 def all_backends() -> List[type[TTSBackend]]:
+    load_active_backend_modules()
     return list(_BACKENDS.values())
 
 
 def get_backend(model_id: str) -> type[TTSBackend]:
+    if model_id not in _BACKENDS:
+        load_active_backend_modules()
     if model_id not in _BACKENDS:
         raise ValueError(f"Unknown TTS backend: {model_id}")
     return _BACKENDS[model_id]
@@ -136,30 +222,24 @@ def create_backend(model_id: str) -> TTSBackend:
 
 
 def detect_active_backends() -> List[type[TTSBackend]]:
-    candidates = [
-        os.environ.get("VIRTUAL_ENV"),
-        os.environ.get("CONDA_DEFAULT_ENV"),
-        sys.prefix if sys.prefix != sys.base_prefix else None,
-    ]
+    load_active_backend_modules()
 
+    venv_name = _current_venv_name()
     matched: List[type[TTSBackend]] = []
-    for candidate in candidates:
-        if not candidate:
-            continue
-        venv_name = Path(candidate).name.lower()
+    if venv_name:
         for cls in _BACKENDS.values():
             try:
                 sentinel = object.__new__(cls)
                 names = [n.lower() for n in sentinel.venv_names]
-                if venv_name in names:
-                    if cls not in matched:
-                        matched.append(cls)
+                if venv_name in names and cls not in matched:
+                    matched.append(cls)
             except Exception:
                 pass
 
     if matched:
         return matched
     return list(_BACKENDS.values())
+
 
 def is_rocm() -> bool:
     try:
