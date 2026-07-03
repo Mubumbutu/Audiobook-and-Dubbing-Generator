@@ -22,13 +22,14 @@ echo  [7]   VoxCPM 2
 echo  [8]   Supertonic 3
 echo  [9]   Piper TTS
 echo  [10]  XTTS v2  (Coqui TTS)
+echo  [11]  Higgs TTS 3  (SGLang-Omni via WSL2 / Docker, requires NVIDIA GPU)
 echo.
 echo  [0]   Exit
 echo.
 
 :PICK
 set CHOICE=
-set /p CHOICE=Enter choice [0-10]: 
+set /p CHOICE=Enter choice [0-11]: 
 
 if "!CHOICE!"=="0"  goto :EXIT
 if "!CHOICE!"=="1"  goto :CHATTERBOX
@@ -41,8 +42,9 @@ if "!CHOICE!"=="7"  goto :VOXCPM2
 if "!CHOICE!"=="8"  goto :SUPERTONIC
 if "!CHOICE!"=="9"  goto :PIPER
 if "!CHOICE!"=="10" goto :XTTSV2
+if "!CHOICE!"=="11" goto :HIGGSWSL
 
-echo  Invalid choice. Please enter a number from 0 to 10.
+echo  Invalid choice. Please enter a number from 0 to 11.
 goto :PICK
 
 :CHATTERBOX
@@ -93,6 +95,11 @@ goto :RUN
 :XTTSV2
 set "SCRIPT=%APP_ROOT%install\xttsv2_install.bat"
 set "MODEL=XTTS v2 (Coqui TTS)"
+goto :RUN
+
+:HIGGSWSL
+set "SCRIPT=%APP_ROOT%install\higgs_wsl_install.bat"
+set "MODEL=Higgs TTS 3 (SGLang-Omni / WSL2 / Docker)"
 goto :RUN
 
 :RUN
