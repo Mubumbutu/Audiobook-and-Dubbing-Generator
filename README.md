@@ -81,6 +81,7 @@ The app supports multiple TTS backends. Available backends are detected automati
 | Supertonic 3 | [huggingface.co/Supertone/supertonic-3](https://huggingface.co/Supertone/supertonic-3) |
 | Piper TTS | [huggingface.co/rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) |
 | XTTS v2 | [huggingface.co/coqui/XTTS-v2](https://huggingface.co/coqui/XTTS-v2) |
+| Higgs TTS 3 | [huggingface.co/bosonai/higgs-tts-3-4b](https://huggingface.co/bosonai/higgs-tts-3-4b) |
 
 Most backends support **voice cloning** via a reference audio file. You can upload a reference `.wav`, optionally pre-process it (resample, convert to mono, normalize, isolate vocals via Demucs), and optionally transcribe it using Whisper before synthesis.
 
