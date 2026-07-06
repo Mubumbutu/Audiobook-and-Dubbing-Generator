@@ -24,7 +24,8 @@ echo The Windows-side venv created by this installer is a thin CLIENT
 echo (HTTP calls to the container) that ALSO hosts local tools that
 echo run directly on Windows: Demucs (vocal isolation), faster-whisper
 echo (transcription) and pyannote.audio (speaker diarization for the
-echo dubbing feature). Those local tools need their own PyTorch, so
+echo dubbing feature).
+echo Those local tools need their own PyTorch, so
 echo this installer detects your GPU on Windows and installs a
 echo matching CUDA build for them - exactly like the Fish S2 Pro
 echo installer does.
@@ -35,11 +36,10 @@ echo   - An Ubuntu distribution registered in WSL2
 echo   - Docker Desktop, with WSL2 integration enabled for that distro
 echo   - An NVIDIA GPU with recent drivers (CUDA passthrough via WSL2)
 echo.
-
 rem ---------------------------------------------------------------
-rem [1/12] Python check (for the thin Windows-side client venv)
+rem [1/13] Python check (for the thin Windows-side client venv)
 rem ---------------------------------------------------------------
-echo [1/12] Checking Python...
+echo [1/13] Checking Python...
 py -3 --version >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Python is not installed or not in PATH.
@@ -52,9 +52,9 @@ echo [OK] Python !PYVER!
 echo.
 
 rem ---------------------------------------------------------------
-rem [2/12] WSL2 check (auto-install if missing, requires Administrator)
+rem [2/13] WSL2 check (auto-install if missing, requires Administrator)
 rem ---------------------------------------------------------------
-echo [2/12] Checking WSL2...
+echo [2/13] Checking WSL2...
 where wsl >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] 'wsl' command not found on this system.
@@ -122,20 +122,19 @@ echo [OK] WSL2 is available
 echo.
 
 rem ---------------------------------------------------------------
-rem [3/12] Check Ubuntu distro is registered
+rem [3/13] Check Ubuntu distro is registered
 rem ---------------------------------------------------------------
-echo [3/12] Checking for WSL distribution '%WSL_DISTRO%'...
+echo [3/13] Checking for WSL distribution '%WSL_DISTRO%'...
 rem NOTE: we deliberately do NOT parse 'wsl -l -q' with a batch for /f loop.
 rem That command prints UTF-16LE text, which cmd.exe's for /f frequently
 rem mis-decodes, causing false "distro not found" results even when it
-rem exists. A direct launch test is reliable regardless of encoding.
+rem exists.
+rem A direct launch test is reliable regardless of encoding.
 wsl -d %WSL_DISTRO% -- true >nul 2>&1
 if not errorlevel 1 goto :DISTRO_OK
 echo [INFO] WSL distribution '%WSL_DISTRO%' does not seem reachable yet.
-echo This installer can add it automatically ^(requires Administrator
-echo rights^).
+echo This installer can add it automatically ^(requires Administrator rights^).
 echo.
-
 net session >nul 2>&1
 if errorlevel 1 (
     echo [INFO] This window is not running as Administrator.
@@ -151,16 +150,14 @@ if errorlevel 1 (
 )
 
 echo [OK] Running as Administrator.
-echo [INFO] Installing distribution '%WSL_DISTRO%' ^(this can take a
-echo        few minutes^)...
+echo [INFO] Installing distribution '%WSL_DISTRO%' ^(this can take a few minutes^)...
 echo.
 wsl --install -d %WSL_DISTRO% 2>"%TEMP%\wsl_distro_install_err.txt"
 set DISTRO_INSTALL_RC=!ERRORLEVEL!
 
 findstr /i "ALREADY_EXISTS" "%TEMP%\wsl_distro_install_err.txt" >nul 2>&1
 if not errorlevel 1 (
-    echo [INFO] Distribution '%WSL_DISTRO%' already exists - this is fine,
-    echo continuing.
+    echo [INFO] Distribution '%WSL_DISTRO%' already exists - this is fine, continuing.
     del "%TEMP%\wsl_distro_install_err.txt" >nul 2>&1
     goto :DISTRO_RECHECK
 )
@@ -186,8 +183,8 @@ echo set up yet ^(it may need a one-time first launch to create a Linux
 echo user account^).
 echo.
 echo Opening it now - please follow the prompts ^(choose a Linux
-echo username and password^). When done, type 'exit' to leave it,
-echo then re-run this installer to continue.
+echo username and password^).
+echo When done, type 'exit' to leave it, then re-run this installer to continue.
 echo.
 wsl -d %WSL_DISTRO%
 echo.
@@ -200,14 +197,13 @@ echo [OK] Distribution '%WSL_DISTRO%' is registered
 echo.
 
 rem ---------------------------------------------------------------
-rem [4/12] Check Docker is reachable from inside WSL2 (auto-start / auto-download if possible)
+rem [4/13] Check Docker is reachable from inside WSL2 (auto-start / auto-download if possible)
 rem ---------------------------------------------------------------
-echo [4/12] Checking Docker inside WSL2 (this requires Docker Desktop running)...
+echo [4/13] Checking Docker inside WSL2 (this requires Docker Desktop running)...
 wsl -d %WSL_DISTRO% -- bash -lc "docker info >/dev/null 2>&1"
 if not errorlevel 1 goto :DOCKER_OK
 
 echo [INFO] Docker is not reachable yet from inside WSL2.
-
 set "DOCKER_DESKTOP_EXE=%ProgramFiles%\Docker\Docker\Docker Desktop.exe"
 if exist "%DOCKER_DESKTOP_EXE%" (
     echo [INFO] Docker Desktop is installed but does not seem to be running.
@@ -231,8 +227,7 @@ if exist "%DOCKER_DESKTOP_EXE%" (
         goto :DOCKER_OK
     )
 
-    echo [ERROR] Docker Desktop was started but is still not reachable
-    echo from WSL2 after waiting.
+    echo [ERROR] Docker Desktop was started but is still not reachable from WSL2 after waiting.
     echo.
     echo Open Docker Desktop manually and check:
     echo   Settings -^> Resources -^> WSL Integration
@@ -283,17 +278,16 @@ echo [OK] Docker is reachable from WSL2
 echo.
 
 rem ---------------------------------------------------------------
-rem [5/12] Check NVIDIA GPU passthrough inside WSL2 (for the Docker
+rem [5/13] Check NVIDIA GPU passthrough inside WSL2 (for the Docker
 rem         container that actually serves Higgs TTS 3)
 rem ---------------------------------------------------------------
-echo [5/12] Checking NVIDIA GPU passthrough inside WSL2...
+echo [5/13] Checking NVIDIA GPU passthrough inside WSL2...
 wsl -d %WSL_DISTRO% -- bash -lc "nvidia-smi >/dev/null 2>&1"
 if errorlevel 1 (
     echo [WARN] 'nvidia-smi' failed inside WSL2.
     echo Higgs TTS 3 needs a working NVIDIA GPU. Make sure:
     echo   - You have an NVIDIA GPU with up-to-date Windows drivers
-    echo     ^(WSL2 CUDA support comes from the Windows driver, no
-    echo      separate Linux NVIDIA driver should be installed in WSL2^)
+    echo     ^(WSL2 CUDA support comes from the Windows driver, no separate Linux NVIDIA driver should be installed in WSL2^)
     echo   - WSL2 kernel is up to date:  wsl --update
     echo Continuing anyway, but model loading will likely fail without a GPU.
 ) else (
@@ -303,14 +297,14 @@ if errorlevel 1 (
 echo.
 
 rem ---------------------------------------------------------------
-rem [6/12] Detect NVIDIA GPU on the Windows HOST itself. This is
-rem         separate from the WSL2 passthrough check above: it picks
+rem [6/13] Detect NVIDIA GPU on the Windows HOST itself.
+rem         This is separate from the WSL2 passthrough check above: it picks
 rem         the right PyTorch/CUDA wheel for the LOCAL client-side
 rem         tools (Demucs, faster-whisper, pyannote.audio) that run
 rem         directly on Windows, not inside the Docker container.
 rem         Same detection logic as fish_s2_pro_install.bat.
 rem ---------------------------------------------------------------
-echo [6/12] Detecting NVIDIA GPU on Windows (for local Demucs / faster-whisper / pyannote.audio)...
+echo [6/13] Detecting NVIDIA GPU on Windows (for local Demucs / faster-whisper / pyannote.audio)...
 set TORCH_INDEX=https://download.pytorch.org/whl/cpu
 set GPU_FOUND=0
 set CUDA_VER=0.0
@@ -346,29 +340,56 @@ for /f "tokens=1,2 delims=." %%A in ("!CUDA_VER!") do (
     set CUDA_MINOR=%%B
 )
 
-set TORCH_INDEX=https://download.pytorch.org/whl/cu121
-if !CUDA_MAJOR! GEQ 13 set TORCH_INDEX=https://download.pytorch.org/whl/cu128
-if !CUDA_MAJOR! EQU 12 (
-    if !CUDA_MINOR! GEQ 8 set TORCH_INDEX=https://download.pytorch.org/whl/cu128
-    if !CUDA_MINOR! GEQ 4 if !CUDA_MINOR! LSS 8 set TORCH_INDEX=https://download.pytorch.org/whl/cu124
+rem NOTE: local tools are pinned to torch==2.8.0 / torchaudio==2.8.0 (see
+rem step 8 below - required by pyannote.audio to avoid torchcodec crashes).
+rem torch 2.8.0 only ships cu126 / cu128 / cu129 / cpu wheels (no cu118,
+rem cu121 or cu124 for this version), so the index picked here MUST be
+rem one of those.
+rem If the installed driver is older than CUDA 12.6, there
+rem is no matching GPU wheel for 2.8.0 and we fall back to CPU.
+set TORCH_INDEX=https://download.pytorch.org/whl/cpu
+set TORCH_CUDA_OK=0
+
+if !CUDA_MAJOR! GEQ 13 (
+    set TORCH_INDEX=https://download.pytorch.org/whl/cu129
+    set TORCH_CUDA_OK=1
+) else if !CUDA_MAJOR! EQU 12 (
+    if !CUDA_MINOR! GEQ 9 (
+        set TORCH_INDEX=https://download.pytorch.org/whl/cu129
+        set TORCH_CUDA_OK=1
+    ) else if !CUDA_MINOR! GEQ 8 (
+        set TORCH_INDEX=https://download.pytorch.org/whl/cu128
+        set TORCH_CUDA_OK=1
+    ) else if !CUDA_MINOR! GEQ 6 (
+        set TORCH_INDEX=https://download.pytorch.org/whl/cu126
+        set TORCH_CUDA_OK=1
+    )
 )
-if !CUDA_MAJOR! EQU 11 set TORCH_INDEX=https://download.pytorch.org/whl/cu118
+
+if !TORCH_CUDA_OK! EQU 0 (
+    echo [WARNING] Your driver reports CUDA !CUDA_VER!, which is older than
+    echo           the CUDA 12.6+ needed by the pinned PyTorch 2.8.0 wheels.
+    echo           Local tools ^(Demucs / faster-whisper / pyannote.audio^)
+    echo           will install as CPU-only. Update your NVIDIA driver and
+    echo           re-run this installer for GPU acceleration.
+)
 echo [OK] Selected wheel index: !TORCH_INDEX!
 goto :client_gpu_done
 
 :no_gpu_client
 echo [INFO] No NVIDIA GPU found on the Windows host - local tools
 echo        ^(Demucs / faster-whisper / pyannote.audio^) will use
-echo        CPU-only PyTorch. The Higgs TTS 3 model itself still runs
+echo        CPU-only PyTorch.
+echo        The Higgs TTS 3 model itself still runs
 echo        on GPU inside the Docker container ^(see step 5 above^).
 
 :client_gpu_done
 echo.
 
 rem ---------------------------------------------------------------
-rem [7/12] Create thin Windows-side venv (client + local tools)
+rem [7/13] Create thin Windows-side venv (client + local tools)
 rem ---------------------------------------------------------------
-echo [7/12] Creating Windows-side client venv (%VENV_DIR%)...
+echo [7/13] Creating Windows-side client venv (%VENV_DIR%)...
 if exist "%VENV_DIR%" (
     rmdir /s /q "%VENV_DIR%"
     echo [OK] Old venv removed
@@ -378,30 +399,45 @@ if errorlevel 1 ( echo [ERROR] Failed to create venv. & pause & exit /b 1 )
 echo [OK] venv created
 echo.
 
-echo [7b/12] Upgrading pip, setuptools, wheel...
+echo [7b/13] Upgrading pip, setuptools, wheel...
 "%VENV_PY%" -m pip install --upgrade pip setuptools wheel --quiet
 if errorlevel 1 ( echo [ERROR] pip upgrade failed. & pause & exit /b 1 )
 echo [OK] pip upgraded
 echo.
 
 rem ---------------------------------------------------------------
-rem [8/12] Install PyTorch + torchaudio for the local tools, using
+rem [8/13] Install PyTorch + torchaudio for the local tools, using
 rem         the wheel index selected in step 6 (GPU) or CPU fallback.
+rem         Versions are PINNED to 2.8.0 because pyannote.audio>=4.0.2
+rem         hard-pins torch==2.8.0 / torchaudio==2.8.0 / torchcodec==0.7.0
+rem         to avoid segfaults from mismatched torch/torchcodec builds.
+rem         Using unpinned "latest" here used to install a newer torch
+rem         whose torchaudio.save() required torchcodec, which was never
+rem         installed - that's what caused:
+rem             ModuleNotFoundError: No module named 'torchcodec.encoders'
+rem         when Demucs ran.
+rem         torchcodec is installed further below from
+rem         the default PyPI index, since the CUDA-specific indexes above
+rem         do not reliably publish Windows torchcodec wheels.
 rem ---------------------------------------------------------------
+set "TORCH_PIN=torch==2.8.0"
+set "TORCHAUDIO_PIN=torchaudio==2.8.0"
+set "TORCHCODEC_PIN=torchcodec==0.7.0"
+
 if "!GPU_FOUND!"=="0" goto :torch_cpu_client
-echo [8/12] Installing PyTorch (CUDA) for local tools from: !TORCH_INDEX!
+echo [8/13] Installing PyTorch (CUDA) for local tools from: !TORCH_INDEX!
 echo (may take a few minutes, downloads ~2-3.5 GB)
-"%VENV_PY%" -m pip install torch torchaudio --index-url !TORCH_INDEX! --quiet
+"%VENV_PY%" -m pip install %TORCH_PIN% %TORCHAUDIO_PIN% --index-url !TORCH_INDEX! --quiet
 if errorlevel 1 (
     echo [WARNING] CUDA PyTorch failed - falling back to CPU...
-    "%VENV_PY%" -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu --quiet
+    "%VENV_PY%" -m pip install %TORCH_PIN% %TORCHAUDIO_PIN% --index-url https://download.pytorch.org/whl/cpu --quiet
     if errorlevel 1 ( echo [ERROR] PyTorch installation failed. & pause & exit /b 1 )
 )
 goto :torch_client_done
 
 :torch_cpu_client
-echo [8/12] Installing PyTorch (CPU only) for local tools...
-"%VENV_PY%" -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu --quiet
+echo [8/13] Installing PyTorch (CPU only) for local tools...
+"%VENV_PY%" -m pip install %TORCH_PIN% %TORCHAUDIO_PIN% --index-url https://download.pytorch.org/whl/cpu --quiet
 if errorlevel 1 ( echo [ERROR] PyTorch installation failed. & pause & exit /b 1 )
 
 :torch_client_done
@@ -409,11 +445,87 @@ if errorlevel 1 ( echo [ERROR] PyTorch installation failed. & pause & exit /b 1 
 echo [OK] PyTorch installed for local client tools
 echo.
 
+echo [8b/13] Installing torchcodec for local tools (from PyPI, CPU build)...
+"%VENV_PY%" -m pip install %TORCHCODEC_PIN% --quiet
+if errorlevel 1 ( echo [ERROR] torchcodec installation failed. & pause & exit /b 1 )
+echo [OK] torchcodec installed
+echo.
+
 rem ---------------------------------------------------------------
-rem [9/12] Install remaining Windows-side client requirements
+rem [9/13] Ensure a "shared" FFmpeg build is available for torchcodec.
+rem         torchcodec does the actual audio encode/decode work by
+rem         loading FFmpeg's shared libraries (avcodec/avformat/...) at
+rem         runtime.
+rem         A normal/static ffmpeg.exe on PATH is NOT enough -
+rem         without the shared DLLs, Demucs and pyannote.audio would
+rem         fail with a *different* error ("Could not load libtorchcodec"
+rem         / "DLL load failed") instead of the ModuleNotFoundError above.
+rem         We install BtbN's FFmpeg 7.1-branch "shared" build via winget
+rem         (pinned to the 7.1 branch, not "latest", because torchcodec
+rem         0.7.0 does not yet support FFmpeg 8) and point the venv at
+rem         its DLLs via a sitecustomize.py, so it works regardless of
+rem         PATH state and without touching the app's own source code.
+rem ---------------------------------------------------------------
+echo [9/13] Setting up FFmpeg (shared build) for torchcodec...
+where winget >nul 2>&1
+if errorlevel 1 (
+    echo [WARNING] 'winget' was not found on this system.
+    echo Demucs / pyannote.audio need a "shared" FFmpeg build to actually
+    echo encode/decode audio via torchcodec. Please install one manually:
+    echo   winget install --id=BtbN.FFmpeg.GPL.Shared.7.1 -e
+    echo ^(or download it yourself from https://github.com/BtbN/FFmpeg-Builds/releases,
+    echo   the "...win64-gpl-shared-7.1.zip" asset^) and re-run this installer.
+    goto :ffmpeg_done
+)
+
+echo Installing/checking BtbN.FFmpeg.GPL.Shared.7.1 via winget...
+winget install --id=BtbN.FFmpeg.GPL.Shared.7.1 -e --accept-package-agreements --accept-source-agreements >nul 2>&1
+
+set "FFMPEG_DLL="
+for /f "delims=" %%D in ('dir /b /s /a-d "%LOCALAPPDATA%\Microsoft\WinGet\Packages\BtbN.FFmpeg.GPL.Shared.7.1_*\avformat-*.dll" 2^>nul') do (
+    if not defined FFMPEG_DLL set "FFMPEG_DLL=%%D"
+)
+
+set "FFMPEG_BIN="
+if defined FFMPEG_DLL (
+    for %%F in ("!FFMPEG_DLL!") do set "FFMPEG_BIN=%%~dpF"
+)
+rem The extracted path always ends in a trailing backslash - strip it, otherwise it
+rem would break the Python raw-string literal written below (r"...\").
+if defined FFMPEG_BIN if "!FFMPEG_BIN:~-1!"=="\" set "FFMPEG_BIN=!FFMPEG_BIN:~0,-1!"
+
+if not defined FFMPEG_BIN (
+    echo [WARNING] Could not locate the FFmpeg shared DLLs after winget install.
+    echo Demucs / pyannote.audio audio encode/decode may fail until FFmpeg
+    echo is available. You can install it manually with:
+    echo   winget install --id=BtbN.FFmpeg.GPL.Shared.7.1 -e
+    goto :ffmpeg_done
+)
+
+echo [OK] Found FFmpeg shared build: !FFMPEG_BIN!
+set "SITECUSTOMIZE=%VENV_DIR%\Lib\site-packages\sitecustomize.py"
+(
+    echo import os
+    echo(
+    echo _FFMPEG_BIN = r"!FFMPEG_BIN!"
+    echo(
+    echo if _FFMPEG_BIN and os.path.isdir^(_FFMPEG_BIN^):
+    echo     try:
+    echo         os.add_dll_directory^(_FFMPEG_BIN^)
+    echo     except ^(AttributeError, OSError^):
+    echo         pass
+    echo     os.environ["PATH"] = _FFMPEG_BIN + os.pathsep + os.environ.get^("PATH", ""^)
+) > "!SITECUSTOMIZE!"
+echo [OK] Wired FFmpeg into the venv via sitecustomize.py
+
+:ffmpeg_done
+echo.
+
+rem ---------------------------------------------------------------
+rem [10/13] Install remaining Windows-side client requirements
 rem         (numpy, soundfile, Demucs, faster-whisper, pyannote.audio, ...)
 rem ---------------------------------------------------------------
-echo [9/12] Installing Windows-side client requirements...
+echo [10/13] Installing Windows-side client requirements...
 if not exist "%~dp0higgs_wsl_requirements.txt" (
     echo [ERROR] higgs_wsl_requirements.txt not found: %~dp0higgs_wsl_requirements.txt
     pause & exit /b 1
@@ -424,9 +536,9 @@ echo [OK] Client requirements installed
 echo.
 
 rem ---------------------------------------------------------------
-rem [10/12] Pull the Docker image (heavy: ~12 GB, prebuilt sglang-omni + CUDA)
+rem [11/13] Pull the Docker image (heavy: ~12 GB, prebuilt sglang-omni + CUDA)
 rem ---------------------------------------------------------------
-echo [10/12] Pulling Docker image %DOCKER_IMAGE% (this can take a while, ~12 GB)...
+echo [11/13] Pulling Docker image %DOCKER_IMAGE% (this can take a while, ~12 GB)...
 wsl -d %WSL_DISTRO% -- bash -lc "docker pull %DOCKER_IMAGE%"
 if errorlevel 1 (
     echo [ERROR] Failed to pull Docker image %DOCKER_IMAGE%.
@@ -437,9 +549,9 @@ echo [OK] Docker image pulled
 echo.
 
 rem ---------------------------------------------------------------
-rem [11/12] Download model weights (public model, no token required)
+rem [12/13] Download model weights (public model, no token required)
 rem ---------------------------------------------------------------
-echo [11/12] Downloading model weights %MODEL_REPO%...
+echo [12/13] Downloading model weights %MODEL_REPO%...
 echo This is a public model - no HuggingFace token required.
 echo Download size is approximately 9 GB, please wait...
 echo.
@@ -452,7 +564,7 @@ if errorlevel 1 (
 )
 echo [OK] Model weights downloaded
 
-echo [12/12] Setting up the sgl-omni serving environment...
+echo [13/13] Setting up the sgl-omni serving environment...
 echo This installs the sglang-omni package inside the container so the
 echo 'sgl-omni' command becomes available (one-time, a few minutes)...
 echo.
@@ -474,11 +586,17 @@ echo ============================================================
 echo Verifying local client-side packages...
 echo ============================================================
 "%VENV_PY%" -c "import torch; print(f' torch {torch.__version__} | CUDA: {torch.cuda.is_available()}')" 2>nul || echo [WARNING] torch
+"%VENV_PY%" -c "import torchaudio; print(f' torchaudio {torchaudio.__version__}')" 2>nul || echo [WARNING] torchaudio
+"%VENV_PY%" -c "import torchcodec; from torchcodec.encoders import AudioEncoder; print(f' torchcodec {torchcodec.__version__}')" 2>nul || echo [WARNING] torchcodec
 "%VENV_PY%" -c "import soundfile; print(' soundfile OK')" 2>nul || echo [WARNING] soundfile
 "%VENV_PY%" -c "from PyQt6.QtWidgets import QApplication; print(' PyQt6 OK')" 2>nul || echo [WARNING] PyQt6
 "%VENV_PY%" -c "import faster_whisper; print(' faster-whisper OK')" 2>nul || echo [WARNING] faster-whisper
 "%VENV_PY%" -c "import demucs; print(' demucs OK')" 2>nul || echo [WARNING] demucs
 "%VENV_PY%" -c "import pyannote.audio; print(' pyannote.audio OK')" 2>nul || echo [WARNING] pyannote.audio
+echo.
+
+echo Testing the exact save path Demucs uses (torchaudio.save -^> torchcodec)...
+"%VENV_PY%" -c "import torch, torchaudio, tempfile, os; p=os.path.join(tempfile.gettempdir(), '_higgs_wsl_save_test.wav'); torchaudio.save(p, torch.zeros(1, 8000), 8000); os.remove(p); print(' Demucs-style audio save OK (torchcodec + FFmpeg working)')" 2>nul || echo [WARNING] torchaudio.save failed - Demucs will likely still crash. Check that FFmpeg installed correctly in step 9.
 
 echo.
 echo ============================================================
@@ -491,7 +609,8 @@ echo   Model repo           : %MODEL_REPO%
 echo   Client venv          : %VENV_DIR%
 echo   Local tools GPU      : !GPU_NAME!
 echo   Local tools CUDA     : !CUDA_VER!
-echo   Local tools PyTorch  : !TORCH_INDEX!
+echo   Local tools PyTorch  : !TORCH_INDEX! ^(torch/torchaudio 2.8.0, torchcodec 0.7.0 - pinned for pyannote.audio compatibility^)
+echo   FFmpeg for torchcodec: !FFMPEG_BIN!
 echo.
 echo Run start.bat and select 'Higgs TTS 3 (WSL2)' to launch the app.
 echo Clicking 'Load model' in the app will start the container and
