@@ -240,8 +240,7 @@ def delete_selected_audio_segment(main_window, start_frac: float, end_frac: floa
     if end_sample - start_sample < 10:
         return
 
-    main_window._audio_undo_stack.append(build_audio_undo_state(main_window))
-    main_window._audio_redo_stack.clear()
+    main_window.undo_manager.push('audio', "audio segment deletion", build_audio_undo_state(main_window))
 
     new_audio  = np.concatenate((
         main_window._audio_data[:start_sample],
@@ -295,8 +294,7 @@ def mute_selected_audio_segment(main_window, start_frac: float, end_frac: float)
     if end_sample - start_sample < 10:
         return
 
-    main_window._audio_undo_stack.append(build_audio_undo_state(main_window))
-    main_window._audio_redo_stack.clear()
+    main_window.undo_manager.push('audio', "audio segment mute", build_audio_undo_state(main_window))
 
     main_window._audio_data = main_window._audio_data.copy()
     main_window._audio_data[start_sample:end_sample] = 0.0
@@ -356,8 +354,7 @@ def apply_trim_to_fragment(main_window):
         main_window._set_status("Aggressiveness too high — would trim everything. Reduce it.", C["warning"])
         return
 
-    main_window._audio_undo_stack.append(build_audio_undo_state(main_window))
-    main_window._audio_redo_stack.clear()
+    main_window.undo_manager.push('audio', "audio trim", build_audio_undo_state(main_window))
 
     new_dur_s        = len(new_audio) / max(1, main_window._audio_sr)
     main_window._audio_data = new_audio
@@ -449,8 +446,7 @@ def apply_trim_to_selected(main_window):
             sf.write(frag['output_path'], new_audio, sr, subtype="PCM_16")
             new_dur_s = len(new_audio) / max(1, sr)
             if frag.get('index') == main_window._current_fragment_idx:
-                main_window._audio_undo_stack.append(build_audio_undo_state(main_window))
-                main_window._audio_redo_stack.clear()
+                main_window.undo_manager.push('audio', "audio trim", build_audio_undo_state(main_window))
                 main_window._audio_data = new_audio
                 main_window._audio_sr   = sr
                 main_window._wave_out.set_audio(main_window._audio_data)
@@ -572,24 +568,6 @@ def restore_audio_state(main_window, state: dict):
         main_window._time_lbl.setText(f"0:00 / {_fmt(dur)}")
 
     main_window._update_trim_preview()
-
-
-def on_wave_undo(main_window):
-    if not main_window._audio_undo_stack or main_window._audio_data is None:
-        return
-    main_window._audio_redo_stack.append(build_audio_undo_state(main_window))
-    state = main_window._audio_undo_stack.pop()
-    restore_audio_state(main_window, state)
-    main_window._set_status("Undo: segment restored", C["accent"])
-
-
-def on_wave_redo(main_window):
-    if not main_window._audio_redo_stack or main_window._audio_data is None:
-        return
-    main_window._audio_undo_stack.append(build_audio_undo_state(main_window))
-    state = main_window._audio_redo_stack.pop()
-    restore_audio_state(main_window, state)
-    main_window._set_status("Redo: segment applied", C["accent"])
 
 
 def play_fragment_audio(main_window, frag: Dict):
