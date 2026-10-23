@@ -1,5 +1,6 @@
 # widgets.py
 import os
+import time
 import numpy as np
 import soundfile as sf
 import sounddevice as sd
@@ -9,10 +10,14 @@ from typing import Optional, List, Tuple, Dict
 from PyQt6.QtWidgets import (
     QWidget, QDialog, QFrame, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QSizePolicy, QCheckBox,
-    QDialogButtonBox, QFileDialog, QTreeWidget, QTreeWidgetItem,
+    QDialogButtonBox, QFileDialog, QTreeWidget, QTreeWidgetItem, QStyle,
 )
-from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSignal
-from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import Qt, QTimer, QSize, QPoint, pyqtSignal
+from PyQt6.QtGui import (
+    QPainter, QColor, QPen, QFont, QDragEnterEvent, QDropEvent,
+    QCursor, QKeySequence, QShortcut,
+)
+from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 from config import C, COL_STATUS, COL_FRAGMENT, COL_SPEAKER, COL_TIMING, STATUS_WAITING, STATUS_DONE, STATUS_ERROR
 from utils import _fmt, _fmt_ms, _get_last_dir, _set_last_dir, _get_wav_duration, _compute_trim_bounds
@@ -541,15 +546,17 @@ class TimingIssuesDialog(QDialog):
             dur = _get_wav_duration(frag.get('output_path', ''))
             if dur is None:
                 continue
-            slot_s = ((frag.get('end_ms', 0) or 0) - (frag.get('start_ms', 0) or 0)) / 1000.0
-            if slot_s <= 0:
+            start_ms = frag.get('start_ms', 0) or 0
+            end_ms = frag.get('srt_end_ms', frag.get('end_ms', 0)) or 0
+            slot_s = (end_ms - start_ms) / 1000.0
+            if dur <= slot_s:
                 continue
-            ratio = dur / max(slot_s, 0.001)
-            if 1.0 < ratio < 2.0:
+            safe_slot = max(slot_s, 0.001)
+            if dur < 2 * safe_slot:
                 y_count += 1
-            elif 2.0 <= ratio < 4.0:
+            elif dur < 4 * safe_slot:
                 o_count += 1
-            elif ratio >= 4.0:
+            else:
                 r_count += 1
         total = (
             (y_count if select_yellow else 0) +
@@ -1007,6 +1014,328 @@ class VideoAudioPlayer(QWidget):
         self.position_updated.emit(self._cursor / max(1, self._sr))
         if was_playing:
             self._play()
+            
+    def has_media(self) -> bool:
+        return self._data is not None
+
+    def is_playing(self) -> bool:
+        return self._playing
+
+    def duration_seconds(self) -> float:
+        if self._data is None:
+            return 0.0
+        return len(self._data) / max(1, self._sr)
+
+    def position_seconds(self) -> float:
+        return self._cursor / max(1, self._sr)
+
+    def toggle_play(self):
+        self._toggle()
+
+    def stop_playback(self):
+        self._stop_now()
+
+    def seek_seconds(self, t: float):
+        dur = self.duration_seconds()
+        if dur <= 0:
+            return
+        t = max(0.0, min(t, dur - 0.05))
+        self._seek_to_frac(t / dur)
+
+    def seek_relative(self, delta_s: float):
+        self.seek_seconds(self.position_seconds() + delta_s)
+
+    def get_volume(self) -> int:
+        return self._vol.value()
+
+    def set_volume(self, value: int):
+        self._vol.setValue(int(value))
+
+
+class ClickableVideoWidget(QVideoWidget):
+    double_clicked = pyqtSignal()
+
+    def mouseDoubleClickEvent(self, e):
+        self.double_clicked.emit()
+        e.accept()
+
+
+class _JumpSlider(QSlider):
+    seek_committed = pyqtSignal(int)
+    scrubbing = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self._scrub = False
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def is_scrubbing(self) -> bool:
+        return self._scrub
+
+    def _value_at(self, x: float) -> int:
+        return QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), int(x), max(1, self.width())
+        )
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        self._scrub = True
+        value = self._value_at(e.position().x())
+        self.setValue(value)
+        self.scrubbing.emit(value)
+
+    def mouseMoveEvent(self, e):
+        if not self._scrub:
+            return
+        value = self._value_at(e.position().x())
+        self.setValue(value)
+        self.scrubbing.emit(value)
+
+    def mouseReleaseEvent(self, e):
+        if not self._scrub:
+            return
+        self._scrub = False
+        self.seek_committed.emit(self.value())
+
+
+class VideoFullscreenWindow(QWidget):
+    toggle_play_requested = pyqtSignal()
+    stop_requested = pyqtSignal()
+    seek_requested = pyqtSignal(float)
+    seek_relative_requested = pyqtSignal(float)
+    volume_changed = pyqtSignal(int)
+    closed = pyqtSignal()
+
+    HIDE_DELAY_S = 2.5
+    OVERLAY_MARGIN = 24
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setObjectName("fsRoot")
+        self.setWindowTitle("Video Preview")
+        self.setStyleSheet("QWidget#fsRoot { background:#000000; }")
+        self._duration_s = 0.0
+        self._last_cursor_pos = None
+        self._last_activity = time.monotonic()
+        self._closing = False
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self.video_widget = ClickableVideoWidget()
+        self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.video_widget.double_clicked.connect(self.leave)
+        lay.addWidget(self.video_widget)
+
+        self._overlay = self._build_overlay()
+        self._build_shortcuts()
+
+        self._poll = QTimer(self)
+        self._poll.setInterval(150)
+        self._poll.timeout.connect(self._poll_mouse)
+
+    def _build_overlay(self) -> QWidget:
+        ov = QWidget(
+            self,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus,
+        )
+        ov.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        ov.setObjectName("fsOverlay")
+        ov.setStyleSheet(f"""
+            QWidget#fsOverlay {{
+                background:#1a1a1a; border:1px solid {C['border']}; border-radius:6px;
+            }}
+            QLabel {{ color:{C['text2']}; font-size:11px; background:transparent; border:none; }}
+            QPushButton {{
+                background:#2a2a2a; border:1px solid #444444; border-radius:4px;
+                color:#cccccc; font-size:11px; padding:4px 10px;
+            }}
+            QPushButton:hover {{ background:#333333; border-color:#666666; color:white; }}
+            QSlider::groove:horizontal {{ height:4px; background:#444444; border-radius:2px; }}
+            QSlider::sub-page:horizontal {{ background:{C['accent']}; border-radius:2px; }}
+            QSlider::handle:horizontal {{
+                background:{C['accent']}; width:12px; margin:-5px 0; border-radius:6px;
+            }}
+        """)
+
+        outer = QVBoxLayout(ov)
+        outer.setContentsMargins(14, 10, 14, 12)
+        outer.setSpacing(8)
+
+        self._frag_lbl = QLabel("")
+        self._frag_lbl.setStyleSheet(
+            f"color:{C['text']};font-size:13px;font-weight:600;background:transparent;border:none;"
+        )
+        outer.addWidget(self._frag_lbl)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        self._play_btn = QPushButton("▶  Play")
+        self._play_btn.setFixedSize(90, 28)
+        self._play_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._play_btn.clicked.connect(lambda: self.toggle_play_requested.emit())
+
+        self._stop_btn = QPushButton("⏹  Stop")
+        self._stop_btn.setFixedSize(80, 28)
+        self._stop_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._stop_btn.clicked.connect(lambda: self.stop_requested.emit())
+
+        mono = "font-family:'Consolas',monospace;"
+        self._time_lbl = QLabel("00:00:00")
+        self._time_lbl.setStyleSheet(f"color:{C['text']};font-size:11px;{mono}background:transparent;border:none;")
+        self._dur_lbl = QLabel("00:00:00")
+        self._dur_lbl.setStyleSheet(f"color:{C['text3']};font-size:11px;{mono}background:transparent;border:none;")
+
+        self._seek = _JumpSlider()
+        self._seek.setRange(0, 1000)
+        self._seek.scrubbing.connect(self._on_scrub)
+        self._seek.seek_committed.connect(self._on_seek_committed)
+
+        vol_icon = QLabel("🔊")
+        self._vol = QSlider(Qt.Orientation.Horizontal)
+        self._vol.setRange(0, 150)
+        self._vol.setValue(100)
+        self._vol.setFixedWidth(90)
+        self._vol.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._vol.valueChanged.connect(self.volume_changed.emit)
+
+        self._exit_btn = QPushButton("✕  Exit")
+        self._exit_btn.setFixedSize(80, 28)
+        self._exit_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._exit_btn.clicked.connect(lambda: self.leave())
+
+        row.addWidget(self._play_btn)
+        row.addWidget(self._stop_btn)
+        row.addWidget(self._time_lbl)
+        row.addWidget(self._seek, 1)
+        row.addWidget(self._dur_lbl)
+        row.addSpacing(6)
+        row.addWidget(vol_icon)
+        row.addWidget(self._vol)
+        row.addSpacing(6)
+        row.addWidget(self._exit_btn)
+        outer.addLayout(row)
+        return ov
+
+    def _build_shortcuts(self):
+        bindings = {
+            "Space": lambda: self._act(self.toggle_play_requested.emit),
+            "Left": lambda: self._act(self.seek_relative_requested.emit, -5.0),
+            "Right": lambda: self._act(self.seek_relative_requested.emit, 5.0),
+            "Shift+Left": lambda: self._act(self.seek_relative_requested.emit, -1.0),
+            "Shift+Right": lambda: self._act(self.seek_relative_requested.emit, 1.0),
+            "Up": lambda: self._act(self._step_volume, 5),
+            "Down": lambda: self._act(self._step_volume, -5),
+            "Esc": lambda: self.leave(),
+            "F": lambda: self.leave(),
+        }
+        for seq, fn in bindings.items():
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(fn)
+
+    def _act(self, fn, *args):
+        self._wake()
+        fn(*args)
+
+    def _step_volume(self, delta: int):
+        self._vol.setValue(self._vol.value() + delta)
+
+    def _on_scrub(self, value: int):
+        self._time_lbl.setText(_fmt(value / 1000.0 * self._duration_s))
+
+    def _on_seek_committed(self, value: int):
+        self.seek_requested.emit(value / 1000.0 * self._duration_s)
+
+    def set_playing(self, playing: bool):
+        self._play_btn.setText("■  Pause" if playing else "▶  Play")
+
+    def set_position(self, pos_s: float, dur_s: float):
+        self._duration_s = max(0.0, dur_s)
+        if self._seek.is_scrubbing():
+            return
+        frac = pos_s / dur_s if dur_s > 0 else 0.0
+        self._seek.setValue(int(min(max(frac, 0.0), 1.0) * 1000))
+        self._time_lbl.setText(_fmt(pos_s))
+        self._dur_lbl.setText(_fmt(dur_s))
+
+    def set_volume(self, value: int):
+        self._vol.blockSignals(True)
+        self._vol.setValue(int(value))
+        self._vol.blockSignals(False)
+
+    def set_fragment(self, text: str):
+        self._frag_lbl.setText(text)
+
+    def enter(self, screen=None):
+        self._closing = False
+        if screen is not None:
+            self.setScreen(screen)
+            self.setGeometry(screen.geometry())
+        self.showFullScreen()
+        self.activateWindow()
+        self.raise_()
+        self.setFocus()
+        self._last_cursor_pos = QCursor.pos()
+        self._wake()
+        self._poll.start()
+
+    def leave(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._poll.stop()
+        self._overlay.hide()
+        self.unsetCursor()
+        self.hide()
+        self.closed.emit()
+
+    def closeEvent(self, e):
+        self.leave()
+        e.accept()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._overlay.isVisible():
+            self._place_overlay()
+
+    def _place_overlay(self):
+        margin = self.OVERLAY_MARGIN
+        width = max(480, min(self.width() - 2 * margin, 1280))
+        height = self._overlay.sizeHint().height()
+        origin = self.mapToGlobal(QPoint(0, 0))
+        x = origin.x() + (self.width() - width) // 2
+        y = origin.y() + self.height() - height - margin
+        self._overlay.setGeometry(x, y, width, height)
+
+    def _wake(self):
+        self._last_activity = time.monotonic()
+        if not self._overlay.isVisible():
+            self._place_overlay()
+            self._overlay.show()
+        self.unsetCursor()
+
+    def _poll_mouse(self):
+        if not self.isVisible():
+            return
+        pos = QCursor.pos()
+        now = time.monotonic()
+        if pos != self._last_cursor_pos:
+            self._last_cursor_pos = pos
+            self._wake()
+            return
+        if (
+            self._overlay.isVisible()
+            and not self._seek.is_scrubbing()
+            and not self._overlay.geometry().contains(pos)
+            and now - self._last_activity > self.HIDE_DELAY_S
+        ):
+            self._overlay.hide()
+            self.setCursor(Qt.CursorShape.BlankCursor)
 
 class DropAudioWidget(QFrame):
     file_dropped = pyqtSignal(str)
