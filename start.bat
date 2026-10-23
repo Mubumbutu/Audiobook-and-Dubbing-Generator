@@ -35,6 +35,9 @@ set "LABEL_venv_supertonic=Supertonic 3"
 set "LABEL_venv_piper=Piper TTS"
 set "LABEL_venv_xttsv2=XTTS v2"
 set "LABEL_venv_higgs_wsl=Higgs TTS 3 (WSL2)"
+set "LABEL_venv_audio8=Audio8 TTS Preview 0.6B"
+set "LABEL_venv_kitten2=KittenTTS 2"
+set "LABEL_venv_ming3=Ming-3.0-tts 0.5B"
 
 set COUNT=0
 for /d %%D in ("venvs\*") do (
@@ -82,6 +85,10 @@ if !CHOICE_NUM! GTR !COUNT! (
 
 set "SELECTED=!VENV_%CHOICE_NUM%!"
 set "ACTIVATE=venvs\!SELECTED!\Scripts\activate.bat"
+if /i "!SELECTED!"=="venv_kitten2" (
+    set PYTHONUTF8=1
+    set PYTHONIOENCODING=utf-8
+)
 
 echo.
 echo [OK] Selected : !SELECTED!
