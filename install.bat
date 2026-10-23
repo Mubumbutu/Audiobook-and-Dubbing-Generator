@@ -23,13 +23,16 @@ echo  [8]   Supertonic 3
 echo  [9]   Piper TTS
 echo  [10]  XTTS v2  (Coqui TTS)
 echo  [11]  Higgs TTS 3  (SGLang-Omni via WSL2 / Docker, requires NVIDIA GPU)
+echo  [12]  Audio8 TTS Preview 0.6B
+echo  [13]  KittenTTS 2
+echo  [14]  Ming-3.0-tts 0.5B
 echo.
 echo  [0]   Exit
 echo.
 
 :PICK
 set CHOICE=
-set /p CHOICE=Enter choice [0-11]: 
+set /p CHOICE=Enter choice [0-14]: 
 
 if "!CHOICE!"=="0"  goto :EXIT
 if "!CHOICE!"=="1"  goto :CHATTERBOX
@@ -43,8 +46,11 @@ if "!CHOICE!"=="8"  goto :SUPERTONIC
 if "!CHOICE!"=="9"  goto :PIPER
 if "!CHOICE!"=="10" goto :XTTSV2
 if "!CHOICE!"=="11" goto :HIGGSWSL
+if "!CHOICE!"=="12" goto :AUDIO8
+if "!CHOICE!"=="13" goto :KITTEN2
+if "!CHOICE!"=="14" goto :MING3
 
-echo  Invalid choice. Please enter a number from 0 to 11.
+echo  Invalid choice. Please enter a number from 0 to 14.
 goto :PICK
 
 :CHATTERBOX
@@ -100,6 +106,21 @@ goto :RUN
 :HIGGSWSL
 set "SCRIPT=%APP_ROOT%install\higgs_wsl_install.bat"
 set "MODEL=Higgs TTS 3 (SGLang-Omni / WSL2 / Docker)"
+goto :RUN
+
+:AUDIO8
+set "SCRIPT=%APP_ROOT%install\audio8_install.bat"
+set "MODEL=Audio8 TTS Preview 0.6B"
+goto :RUN
+
+:KITTEN2
+set "SCRIPT=%APP_ROOT%install\kitten2_install.bat"
+set "MODEL=KittenTTS 2"
+goto :RUN
+
+:MING3
+set "SCRIPT=%APP_ROOT%install\ming3_install.bat"
+set "MODEL=Ming-3.0-tts 0.5B"
 goto :RUN
 
 :RUN
