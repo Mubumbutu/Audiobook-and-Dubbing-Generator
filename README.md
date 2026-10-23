@@ -1,10 +1,46 @@
 # Audiobook and Dubbing Generator
+<p align="center">
+</p>
 
-[![Watch the video](https://img.youtube.com/vi/nhQ0yTyRaj4/maxresdefault.jpg)](https://www.youtube.com/watch?v=nhQ0yTyRaj4)
+
+<p align="center">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.0.0-blue" />
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white" />
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-lightgrey" />
+  <img alt="CUDA" src="https://img.shields.io/badge/CUDA-11.8%20%7C%2012.1%20%7C%2012.4-76b900?logo=nvidia&logoColor=white" />
+  <img alt="Status" src="https://img.shields.io/badge/status-stable-brightgreen" />
+  <img alt="License" src="https://img.shields.io/badge/License-GPLv3-blue" />
+</p>
 
 A desktop application for AI-powered text-to-speech synthesis, Lektor-style audio generation, audiobook creation from eBooks, and multi-speaker dubbing for both audiobooks and video content.
 
+---
+
 <img width="1527" height="998" alt="dr" src="https://github.com/user-attachments/assets/1a124398-332b-4b5e-a995-d0e3413820e6" />
+
+---
+
+<details>
+<summary>Click to see an example</summary>
+
+[![Watch the video](https://img.youtube.com/vi/nhQ0yTyRaj4/maxresdefault.jpg)](https://www.youtube.com/watch?v=nhQ0yTyRaj4)
+
+</details>
+
+---
+
+## Changelog
+
+<details>
+<summary><b>Version history</b> (click to expand)</summary>
+
+<br>
+
+### [1.0.0] - 2026-10-23
+**Added**
+- Initial public release version 1.0.0.
+
+</details>
 
 ---
 
@@ -13,7 +49,7 @@ A desktop application for AI-powered text-to-speech synthesis, Lektor-style audi
 The app has three main modes, accessible as tabs:
 
 ### 📄 SRT Fragments
-Load an `.srt` or `.txt` subtitle file and synthesize each fragment into a separate audio clip using a TTS model. Once all fragments are generated, you can export a video with the synthesized lektor track mixed on top of the original audio (requires ffmpeg).
+Load an `.srt`, `.txt` or `.ass` subtitle file and synthesize each fragment into a separate audio clip using a TTS model. Once all fragments are generated, you can export a video with the synthesized lektor track mixed on top of the original audio (requires ffmpeg).
 
 Supports multi-speaker dubbing: load a video, run automatic speaker diarization (via `pyannote/speaker-diarization-3.1`, requires a Hugging Face token), assign reference voices to each detected speaker, and let the app synthesize each line with the correct voice.
 
@@ -82,6 +118,9 @@ The app supports multiple TTS backends. Available backends are detected automati
 | Piper TTS | [huggingface.co/rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) |
 | XTTS v2 | [huggingface.co/coqui/XTTS-v2](https://huggingface.co/coqui/XTTS-v2) |
 | Higgs TTS 3 | [huggingface.co/bosonai/higgs-tts-3-4b](https://huggingface.co/bosonai/higgs-tts-3-4b) |
+| Ming 3.0 TTS | [huggingface.co/inclusionAI/Ming-3.0-tts-0.5b](https://huggingface.co/inclusionAI/Ming-3.0-tts-0.5b) |
+| Kitten TTS 2 | [huggingface.co/KittenML/kitten-tts-2](https://huggingface.co/KittenML/kitten-tts-2) |
+| Audio8 TTS Preview | [huggingface.co/Edge0/Audio8-TTS-Preview-0.6b](https://huggingface.co/Edge0/Audio8-TTS-Preview-0.6b) |
 
 Most backends support **voice cloning** via a reference audio file. You can upload a reference `.wav`, optionally pre-process it (resample, convert to mono, normalize, isolate vocals via Demucs), and optionally transcribe it using Whisper before synthesis.
 
