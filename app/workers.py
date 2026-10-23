@@ -92,7 +92,10 @@ class TTSWorker(QThread):
                  generation_settings: Optional[Dict] = None,
                  normalize_audio: bool = False,
                  speaker_voices: Optional[Dict] = None,
-                 reserved_paths: Optional[set] = None):
+                 reserved_paths: Optional[set] = None,
+                 retry_until_fit: bool = False,
+                 max_retries: int = 0,
+                 retry_tolerance_s: float = 0.0):
         super().__init__()
         self.backend             = backend
         self.fragments           = fragments
@@ -104,6 +107,9 @@ class TTSWorker(QThread):
         self.normalize_audio     = normalize_audio
         self.speaker_voices      = speaker_voices or {}
         self.reserved_paths      = set(reserved_paths or set())
+        self.retry_until_fit     = bool(retry_until_fit)
+        self.max_retries         = max(0, int(max_retries))
+        self.retry_tolerance_s   = max(0.0, float(retry_tolerance_s))
         self._cancelled          = False
  
     def request_cancel(self) -> None:
@@ -161,27 +167,99 @@ class TTSWorker(QThread):
                 ref_audio = self.reference_audio
                 ref_text  = self.reference_text
 
+            start_ms = fragment.get("start_ms", 0) or 0
+            end_ms   = fragment.get("end_ms", 0) or 0
+            srt_end  = fragment.get("srt_end_ms", end_ms)
+            if srt_end is None:
+                srt_end = end_ms
+            slot_s = (srt_end - start_ms) / 1000.0
+            tol_s  = self.retry_tolerance_s
+
+            def _fits(d: float, _slot=slot_s, _tol=tol_s) -> bool:
+                if _tol <= 0.0:
+                    return d <= _slot
+                return round(d - _slot, 1) <= _tol + 1e-9
+
+            if self.retry_until_fit and self.max_retries > 0 and slot_s > 0:
+                max_attempts = 1 + self.max_retries
+            else:
+                max_attempts = 1
+
+            temp_files: List[Tuple[float, str]] = []
+
             try:
-                audio, sr = self.backend.generate(
-                    text=text,
-                    reference_audio_path=ref_audio,
-                    reference_text=ref_text,
-                    progress_cb=lambda m, _i=idx: self.progress.emit(_i, m, False),
-                    **self.generation_settings,
-                )
+                best_dur = None
+                attempts = 0
 
-                min_samples = max(1, int(sr * 0.05))
-                if audio is None or len(audio) < min_samples:
-                    raise ValueError(
-                        f"Generated audio is too short "
-                        f"({0 if audio is None else len(audio)} samples / "
-                        f"{0.0 if audio is None else len(audio) / max(1, sr):.3f}s) "
-                        f"for fragment {idx + 1}"
+                for attempt in range(1, max_attempts + 1):
+                    attempts = attempt
+                    try:
+                        audio, sr = self.backend.generate(
+                            text=text,
+                            reference_audio_path=ref_audio,
+                            reference_text=ref_text,
+                            progress_cb=lambda m, _i=idx: self.progress.emit(_i, m, False),
+                            **self.generation_settings,
+                        )
+
+                        min_samples = max(1, int(sr * 0.05))
+                        if audio is None or len(audio) < min_samples:
+                            raise ValueError(
+                                f"Generated audio is too short "
+                                f"({0 if audio is None else len(audio)} samples / "
+                                f"{0.0 if audio is None else len(audio) / max(1, sr):.3f}s) "
+                                f"for fragment {idx + 1}"
+                            )
+
+                        dur = len(audio) / max(1, sr)
+                        attempt_path = f"{output_path}.try{attempt}.tmp"
+                        sf.write(attempt_path, audio, sr, subtype="PCM_16", format="WAV")
+                    except Exception:
+                        if not temp_files:
+                            raise
+                        attempts = attempt - 1
+                        break
+
+                    temp_files.append((dur, attempt_path))
+                    del audio
+
+                    if best_dur is None or dur < best_dur:
+                        best_dur = dur
+
+                    if _fits(best_dur):
+                        break
+                    if self._cancelled:
+                        break
+
+                    if attempt < max_attempts:
+                        self.progress.emit(
+                            idx,
+                            f"Fragment {idx + 1}: {dur:.1f}s exceeds {slot_s:.1f}s slot — "
+                            f"retry {attempt}/{max_attempts - 1}…",
+                            False,
+                        )
+
+                best_dur, best_path = min(temp_files, key=lambda c: c[0] - slot_s)
+                os.replace(best_path, output_path)
+                temp_files = [c for c in temp_files if c[1] != best_path]
+
+                if max_attempts > 1 and not _fits(best_dur):
+                    done_msg = (
+                        f"✓ Fragment {idx + 1} done — best of {attempts} attempts is still "
+                        f"{best_dur - slot_s:.1f}s over the slot"
                     )
+                elif max_attempts > 1 and best_dur > slot_s:
+                    done_msg = (
+                        f"✓ Fragment {idx + 1} accepted within tolerance — "
+                        f"+{best_dur - slot_s:.1f}s over the slot "
+                        f"after {attempts} attempt(s)"
+                    )
+                elif attempts > 1:
+                    done_msg = f"✓ Fragment {idx + 1} fits the slot after {attempts} attempts"
+                else:
+                    done_msg = f"✓ Fragment {idx + 1} done"
 
-                sf.write(output_path, audio, sr, subtype="PCM_16")
-
-                self.progress.emit(idx, f"✓ Fragment {idx + 1} done", False)
+                self.progress.emit(idx, done_msg, False)
                 self.item_done.emit(idx, output_path, False)
 
             except Exception as e:
@@ -190,6 +268,12 @@ class TTSWorker(QThread):
                 self.item_done.emit(idx, msg, True)
 
             finally:
+                for _dur, tmp_path in temp_files:
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except OSError:
+                        logger.warning(f"Could not remove temporary file: {tmp_path}")
                 gc.collect()
                 if TORCH_AVAILABLE and torch.cuda.is_available():
                     torch.cuda.empty_cache()
