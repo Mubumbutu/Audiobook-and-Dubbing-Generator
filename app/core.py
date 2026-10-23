@@ -119,6 +119,7 @@ from session_manager import (
     _auto_ebook_session_path as auto_ebook_session_path,
 )
 
+from undo_manager import UndoManager
 from tabs.srt_tab import SrtTab
 from tabs.ebook_tab import EbookTab
 from tabs.quick_tts_tab import QuickTTSTab
@@ -258,6 +259,8 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------------
 
     def _build_ui(self):
+        self.undo_manager = UndoManager(self)
+
         c = QWidget()
         self.setCentralWidget(c)
 
@@ -271,7 +274,6 @@ class MainWindow(QMainWindow):
         sp.addWidget(self._make_left_panel())
         sp.addWidget(self._make_right_panel())
 
-        # Po utworzeniu prawego panelu – wszystkie współdzielone widżety już istnieją
         self.srt_tab.set_shared_widgets(
             self._btn_start,
             self._btn_stop,
@@ -304,8 +306,8 @@ class MainWindow(QMainWindow):
 
         root.addWidget(self._make_player_bar())
 
-        QShortcut(QKeySequence("Ctrl+Z"), self).activated.connect(self._on_wave_undo)
-        QShortcut(QKeySequence("Ctrl+Y"), self).activated.connect(self._on_wave_redo)
+        QShortcut(QKeySequence("Ctrl+Z"), self).activated.connect(self.undo_manager.undo)
+        QShortcut(QKeySequence("Ctrl+Y"), self).activated.connect(self.undo_manager.redo)
 
         self._status_bar = QStatusBar()
         self._status_lbl = QLabel("…")
@@ -798,6 +800,7 @@ class MainWindow(QMainWindow):
         is_quick = index == 2
         self._btn_start.setVisible(not is_quick)
         self._btn_stop.setVisible(not is_quick)
+        self._retry_container.setVisible(index == 0)
         self._lektor_section.setVisible(not is_quick and not is_ebook)
         self.srt_tab.set_lektor_tab_active(not is_quick and not is_ebook)
         self._audiobook_section.setVisible(is_ebook)
@@ -817,6 +820,85 @@ class MainWindow(QMainWindow):
         self._btn_start.setMinimumWidth(160)
         self._btn_start.setEnabled(False)
         self._btn_start.clicked.connect(self._start_synthesis)
+
+        self._retry_check = QCheckBox("Retry until it fits")
+        self._retry_check.setToolTip(
+            "When enabled, a fragment whose generated audio is longer than its "
+            "subtitle slot (timing not green) is generated again, up to the "
+            "chosen number of retries, until it fits.\n"
+            "The shortest result is kept. The next fragment is generated only "
+            "after the current one fits or the retries run out.\n"
+            "Applies to the SRT tab only."
+        )
+
+        self._retry_label = QLabel("Max retries:")
+
+        self._retry_spin = QSpinBox()
+        self._retry_spin.setRange(1, 50)
+        self._retry_spin.setValue(5)
+        self._retry_spin.setFixedWidth(52)
+        self._retry_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self._retry_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._retry_spin.setStyleSheet(
+            f"color:{C['text']};border:1px solid {C['border']};"
+            "border-radius:3px;padding:1px 3px;"
+        )
+        self._retry_spin.setToolTip(
+            "Maximum number of additional attempts per fragment.\n"
+            "Total attempts = retries + 1. More retries can take much longer."
+        )
+
+        self._retry_tol_label = QLabel("Tolerance:")
+
+        self._retry_tol_spin = QDoubleSpinBox()
+        self._retry_tol_spin.setRange(0.0, 60.0)
+        self._retry_tol_spin.setDecimals(1)
+        self._retry_tol_spin.setSingleStep(0.1)
+        self._retry_tol_spin.setValue(0.0)
+        self._retry_tol_spin.setSuffix(" s")
+        self._retry_tol_spin.setFixedWidth(64)
+        self._retry_tol_spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        self._retry_tol_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._retry_tol_spin.setStyleSheet(
+            f"color:{C['text']};border:1px solid {C['border']};"
+            "border-radius:3px;padding:1px 3px;"
+        )
+        self._retry_tol_spin.setToolTip(
+            "Accepted overflow in seconds, as shown in the Timing column, e.g. (+0.3s).\n"
+            "If the generated audio exceeds its slot by no more than this value, "
+            "the fragment is accepted (it may stay yellow) and synthesis moves on "
+            "to the next fragment.\n"
+            "0.0 s = inactive (audio must fit the slot exactly)."
+        )
+
+        self._retry_options = QWidget()
+        opt_lay = QHBoxLayout(self._retry_options)
+        opt_lay.setContentsMargins(0, 0, 0, 0)
+        opt_lay.setSpacing(4)
+        opt_lay.addWidget(self._retry_label)
+        opt_lay.addWidget(self._retry_spin)
+        opt_lay.addSpacing(6)
+        opt_lay.addWidget(self._retry_tol_label)
+        opt_lay.addWidget(self._retry_tol_spin)
+        self._retry_options.setVisible(False)
+
+        self._retry_container = QWidget()
+        self._retry_container.setStyleSheet(
+            f"background:transparent;border:none;color:{C['text2']};font-size:11px;"
+        )
+        retry_lay = QHBoxLayout(self._retry_container)
+        retry_lay.setContentsMargins(0, 0, 0, 0)
+        retry_lay.setSpacing(8)
+        retry_lay.addWidget(self._retry_check)
+        retry_lay.addWidget(self._retry_options)
+        retry_lay.addStretch()
+        self._retry_check.toggled.connect(self._retry_options.setVisible)
+
+        start_col = QVBoxLayout()
+        start_col.setContentsMargins(0, 0, 0, 0)
+        start_col.setSpacing(4)
+        start_col.addWidget(self._btn_start)
+        start_col.addWidget(self._retry_container)
 
         self._btn_stop = QPushButton("⏹  Stop")
         self._btn_stop.setStyleSheet(_btn(C["warning"]))
@@ -840,8 +922,8 @@ class MainWindow(QMainWindow):
         self._progress.setTextVisible(False)
         self._progress.setVisible(False)
 
-        lay.addWidget(self._btn_start)
-        lay.addWidget(self._btn_stop)
+        lay.addLayout(start_col)
+        lay.addWidget(self._btn_stop, 0, Qt.AlignmentFlag.AlignTop)
         lay.addWidget(self._synth_progress, 1)
         lay.addWidget(self._eta_label)
         lay.addWidget(self._progress, 1)
@@ -1213,26 +1295,6 @@ class MainWindow(QMainWindow):
     # Audio Playback (shared)
     # ---------------------------------------------------------------------
 
-    def _on_wave_undo(self):
-        if self._audio_undo_stack:
-            state = self._audio_undo_stack.pop()
-            self._audio_redo_stack.append({
-                'audio': self._audio_data.copy() if self._audio_data is not None else None,
-                'sr': self._audio_sr,
-                'cursor': self._cursor,
-            })
-            restore_audio_state(self, state)
-
-    def _on_wave_redo(self):
-        if self._audio_redo_stack:
-            state = self._audio_redo_stack.pop()
-            self._audio_undo_stack.append({
-                'audio': self._audio_data.copy() if self._audio_data is not None else None,
-                'sr': self._audio_sr,
-                'cursor': self._cursor,
-            })
-            restore_audio_state(self, state)
-
     def _load_audio_file(self, path: str, idx: int) -> bool:
         try:
             audio, sr = sf.read(path, dtype="float32")
@@ -1376,6 +1438,7 @@ class MainWindow(QMainWindow):
             or model_id == "voxcpm2-voiceclone"
             or model_id.startswith("supertonic_")
             or model_id == "piper"
+            or model_id == "kitten2"
         )
         if hasattr(self, "_whisper_ref_text_label"):
             self._whisper_ref_text_label.setVisible(not hide_ref_text)
@@ -1443,6 +1506,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "_model_combo"):
             return
         self._model_is_loaded = False
+        self.undo_manager.clear()
         try:
             model_id = self._model_combo.currentData()
             self._backend = create_backend(model_id)
@@ -2521,6 +2585,7 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass
         stop_play(self)
+        self.undo_manager.clear()
         if self._audio_tmp and Path(self._audio_tmp).exists():
             try:
                 os.unlink(self._audio_tmp)
