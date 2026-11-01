@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QWidget, QDialog, QFrame, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QSizePolicy, QCheckBox,
     QDialogButtonBox, QFileDialog, QTreeWidget, QTreeWidgetItem, QStyle,
+    QMessageBox,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, QPoint, pyqtSignal
 from PyQt6.QtGui import (
@@ -318,19 +319,31 @@ class SelectionWaveformWidget(QWidget):
             if e.key() == Qt.Key.Key_Delete:
                 sel = self.get_selection()
                 if sel:
-                    self.delete_requested.emit(sel[0], sel[1])
-                    self._sel_start = None
-                    self._sel_end   = None
-                    self.update()
-                    e.accept()
-                    return
-            elif e.modifiers() & Qt.KeyboardModifier.ControlModifier and e.key() == Qt.Key.Key_M:
-                sel = self.get_selection()
-                if sel:
-                    self.mute_requested.emit(sel[0], sel[1])
-                    self._sel_start = None
-                    self._sel_end   = None
-                    self.update()
+                    seg_s = (sel[1] - sel[0]) * self._duration if self._duration > 0 else 0.0
+                    if seg_s > 0:
+                        text = (
+                            f"What do you want to do with the selected part ({seg_s:.2f}s)?\n\n"
+                            "Ctrl+Z restores it."
+                        )
+                    else:
+                        text = (
+                            "What do you want to do with the selected part?\n\n"
+                            "Ctrl+Z restores it."
+                        )
+                    msg = QMessageBox(self)
+                    msg.setWindowTitle("Edit selection")
+                    msg.setIcon(QMessageBox.Icon.Question)
+                    msg.setText(text)
+                    mute_btn = msg.addButton("Mute", QMessageBox.ButtonRole.ActionRole)
+                    delete_btn = msg.addButton("Delete", QMessageBox.ButtonRole.DestructiveRole)
+                    cancel_btn = msg.addButton(QMessageBox.StandardButton.Cancel)
+                    msg.setDefaultButton(cancel_btn)
+                    msg.exec()
+                    clicked = msg.clickedButton()
+                    if clicked == mute_btn:
+                        self.mute_requested.emit(sel[0], sel[1])
+                    elif clicked == delete_btn:
+                        self.delete_requested.emit(sel[0], sel[1])
                     e.accept()
                     return
         super().keyPressEvent(e)
