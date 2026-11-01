@@ -161,6 +161,9 @@ class MainWindow(QMainWindow):
         self._output_dir: str = str(OUTPUTS_DIR)
         self._is_running: bool = False
         self._model_is_loaded: bool = False
+        self._backends_cache: Dict = {}
+        self._loading_model_ids: set = set()
+        self._unloading_model_ids: set = set()
         self._completed_count: int = 0
         self._worker: Optional[TTSWorker] = None
         self._lektor_export_thread: Optional[LektorExportThread] = None
@@ -239,7 +242,7 @@ class MainWindow(QMainWindow):
                 if hasattr(self, "_model_combo")
                 else MODEL_OPTIONS[0][0]
             )
-            self._backend = create_backend(model_id)
+            self._backend = self._get_backend(model_id)
             self._whisper_backend = WhisperBackend(WHISPER_DIR)
             self._preprocessor = AudioPreprocessor(PROC_DIR)
             self._refresh_fish_ui()
@@ -317,74 +320,6 @@ class MainWindow(QMainWindow):
         self._status_bar.addPermanentWidget(self._device_lbl)
 
         self.setStatusBar(self._status_bar)
-
-    def _make_header(self) -> QWidget:
-        w = QWidget()
-        w.setFixedHeight(56)
-        w.setStyleSheet(f"""QWidget{{
-            background:qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                stop:0 {C['surface']},stop:0.5 #0d1e2a,stop:1 {C['surface']});
-            border-bottom:1px solid {C['border']};}}""")
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(20, 0, 20, 0)
-        if _ACTIVE_BACKEND_CLASSES:
-            _inst = object.__new__(_ACTIVE_BACKEND_CLASSES[0])
-            try:
-                _hicon = _inst.header_icon
-            except Exception:
-                _hicon = "🎙"
-            try:
-                _htitle = _inst.header_title
-            except Exception:
-                _htitle = "TTS Studio"
-        else:
-            _hicon = "🎙"
-            _htitle = "TTS Studio"
-        logo = QLabel(_hicon)
-        logo.setStyleSheet("font-size:22px;background:transparent;border:none;")
-        title = QLabel(_htitle)
-        title.setStyleSheet(f"font-size:18px;font-weight:700;color:{C['text']};background:transparent;border:none;")
-        sub = QLabel("SRT Lektor Studio")
-        sub.setStyleSheet(f"font-size:11px;color:{C['accent']};background:transparent;border:none;letter-spacing:2px;")
-        col = QVBoxLayout()
-        col.setSpacing(1)
-        col.addWidget(title)
-        col.addWidget(sub)
-        lay.addWidget(logo)
-        lay.addSpacing(8)
-        lay.addLayout(col)
-        lay.addStretch()
-        model_lbl = QLabel("Model:")
-        model_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;background:transparent;border:none;")
-        self._model_combo = QComboBox()
-        for key, name in MODEL_OPTIONS:
-            self._model_combo.addItem(name, key)
-        self._model_combo.setFixedWidth(290)
-        self._model_combo.currentIndexChanged.connect(self._on_model_changed)
-        lay.addWidget(model_lbl)
-        lay.addSpacing(4)
-        lay.addWidget(self._model_combo)
-        lay.addSpacing(12)
-        self._model_lbl = QLabel("● Model not downloaded")
-        self._model_lbl.setStyleSheet(f"color:{C['warning']};font-size:11px;background:transparent;border:none;")
-        self._dl_fish_btn = QPushButton("⬇  Download model")
-        self._dl_fish_btn.setStyleSheet(_btn(C["accent"]))
-        self._dl_fish_btn.clicked.connect(self._start_model_download)
-        self._load_btn = QPushButton("⚡  Load model")
-        self._load_btn.setStyleSheet(_btn(C["accent"]))
-        self._load_btn.clicked.connect(self._load_fish_model)
-        self._unload_btn = QPushButton("🗑  Unload")
-        self._unload_btn.setStyleSheet(_btn(C["error"]))
-        self._unload_btn.setVisible(False)
-        self._unload_btn.clicked.connect(self._unload_fish_model)
-        lay.addWidget(self._model_lbl)
-        lay.addSpacing(10)
-        lay.addWidget(self._dl_fish_btn)
-        lay.addSpacing(6)
-        lay.addWidget(self._load_btn)
-        lay.addSpacing(6)
-        lay.addWidget(self._unload_btn)
-        return w
 
     def _make_left_panel(self) -> QWidget:
         w = QWidget()
@@ -995,6 +930,15 @@ class MainWindow(QMainWindow):
                     cb.setToolTip(p["tip"])
                 row_l.addWidget(cb, 1)
                 self._param_widgets[key] = cb
+            elif p["type"] == "text":
+                te = QPlainTextEdit()
+                te.setPlainText(p.get("default", ""))
+                te.setFixedHeight(52)
+                te.setFont(QFont("Segoe UI", 11))
+                if p.get("tip"):
+                    te.setToolTip(p["tip"])
+                row_l.addWidget(te, 1)
+                self._param_widgets[key] = te
             elif p["type"] == "dspinbox":
                 dsp = QDoubleSpinBox()
                 dsp.setRange(p["min"], p["max"])
@@ -1041,6 +985,19 @@ class MainWindow(QMainWindow):
             max_tok_w.valueChanged.connect(self._update_token_hint)
             tgt_tok_w.valueChanged.connect(self._update_token_hint)
 
+        if "maya1_voice" in self._param_widgets and "maya1_description" in self._param_row_widgets:
+            _vcb = self._param_widgets["maya1_voice"]
+            _drow = self._param_row_widgets["maya1_description"]
+            def _on_maya_voice_changed(*_args):
+                _is_custom = _vcb.currentData() == "custom"
+                _is_maya = (
+                    self._backend is not None
+                    and self._backend.model_id == "maya1"
+                )
+                _drow.setVisible(_is_custom and _is_maya)
+            _vcb.currentIndexChanged.connect(_on_maya_voice_changed)
+            _drow.setVisible(False)
+
         return container
 
     def _update_params_visibility(self, model_id: str):
@@ -1050,6 +1007,16 @@ class MainWindow(QMainWindow):
         active_keys = {p["key"] for p in params}
         for key, row_w in self._param_row_widgets.items():
             row_w.setVisible(key in active_keys)
+        if "maya1_description" in self._param_row_widgets and "maya1_voice" in self._param_widgets:
+            _vcb = self._param_widgets["maya1_voice"]
+            _is_custom = _vcb.currentData() == "custom"
+            _is_maya = (
+                model_id == "maya1"
+                or (self._backend is not None and self._backend.model_id == "maya1")
+            )
+            self._param_row_widgets["maya1_description"].setVisible(
+                "maya1_description" in active_keys and _is_custom and _is_maya
+            )
         show_hint = (
             "max_new_tokens" in active_keys
             and "target_tokens" in active_keys
@@ -1088,6 +1055,8 @@ class MainWindow(QMainWindow):
                 widget.setValue(float(p["default"]))
             elif isinstance(widget, QSpinBox):
                 widget.setValue(p["default"])
+            elif isinstance(widget, QPlainTextEdit):
+                widget.setPlainText(p.get("default", ""))
             elif isinstance(widget, QComboBox):
                 options = p.get("options", [])
                 idx = next(
@@ -1110,6 +1079,8 @@ class MainWindow(QMainWindow):
                 result[key] = widget.value()
             elif isinstance(widget, QSpinBox):
                 result[key] = widget.value()
+            elif isinstance(widget, QPlainTextEdit):
+                result[key] = widget.toPlainText().strip()
             elif isinstance(widget, QComboBox):
                 result[key] = widget.currentData()
         if self._is_omnivoice_active():
@@ -1333,15 +1304,45 @@ class MainWindow(QMainWindow):
             return False
         return self._backend.is_available()
 
+    def _get_backend(self, model_id: str):
+        backend = self._backends_cache.get(model_id)
+        if backend is None:
+            backend = create_backend(model_id)
+            self._backends_cache[model_id] = backend
+        return backend
+
+    @staticmethod
+    def _is_backend_loaded(backend) -> bool:
+        return backend is not None and bool(getattr(backend, "is_loaded", False))
+
     def _refresh_fish_ui(self):
         dl = self._model_downloaded()
-        loaded = self._model_is_loaded and self._backend is not None
+        loaded = self._is_backend_loaded(self._backend)
+        self._model_is_loaded = loaded
+        model_id = self._model_combo.currentData()
+        loading_current = model_id in self._loading_model_ids
+        unloading_current = model_id in self._unloading_model_ids
+        w_dl = getattr(self, "_w_dl", None)
+        download_active = w_dl is not None and w_dl.isRunning()
+        if download_active:
+            self._dl_fish_btn.setEnabled(False)
+            self._dl_fish_btn.setText("⬇  Downloading…")
+        else:
+            self._dl_fish_btn.setEnabled(True)
+            self._dl_fish_btn.setText("⬇  Download model")
         self._dl_fish_btn.setVisible(not dl)
         self._load_btn.setVisible(dl and not loaded)
-        self._load_btn.setEnabled(True)
-        self._load_btn.setText("⚡  Load model")
+        self._load_btn.setEnabled(not self._loading_model_ids)
+        self._load_btn.setText("⚡  Loading…" if loading_current else "⚡  Load model")
         self._unload_btn.setVisible(loaded)
-        if loaded:
+        self._unload_btn.setEnabled(not unloading_current)
+        self._unload_btn.setText("⏳  Unloading…" if unloading_current else "🗑  Unload")
+        if loading_current:
+            self._model_lbl.setText("● Loading…")
+            self._model_lbl.setStyleSheet(
+                f"color:{C['warning']};font-size:11px;background:transparent;border:none;"
+            )
+        elif loaded:
             self._model_lbl.setText("● Model loaded")
             self._model_lbl.setStyleSheet(
                 f"color:{C['success']};font-size:11px;background:transparent;border:none;"
@@ -1390,13 +1391,18 @@ class MainWindow(QMainWindow):
         is_ov = model_id.startswith("omnivoice_")
         is_supertonic = model_id.startswith("supertonic_")
         is_piper = model_id == "piper"
-        is_no_clone = is_supertonic or is_piper
+        is_veena = model_id == "veena"
+        is_maya = model_id == "maya1"
+        is_no_clone = is_supertonic or is_piper or is_veena or is_maya
 
         self._omnivoice_mode_widget.setVisible(is_ov)
         if hasattr(self, "_supertonic_single_hint"):
             self._supertonic_single_hint.setVisible(is_no_clone and not is_ov)
 
         if is_ov:
+            for attr in ("_drop", "_ref_player", "_ref_audio_info_lbl", "_proc_section"):
+                if hasattr(self, attr):
+                    getattr(self, attr).setVisible(True)
             self._on_voice_mode_changed()
         else:
             is_voxcpm2_voicedesign = (model_id == "voxcpm2-voicedesign")
@@ -1439,6 +1445,8 @@ class MainWindow(QMainWindow):
             or model_id.startswith("supertonic_")
             or model_id == "piper"
             or model_id == "kitten2"
+            or model_id == "veena"
+            or model_id == "maya1"
         )
         if hasattr(self, "_whisper_ref_text_label"):
             self._whisper_ref_text_label.setVisible(not hide_ref_text)
@@ -1458,7 +1466,7 @@ class MainWindow(QMainWindow):
             self._device_lbl.setStyleSheet(f"color:{C['warning']};")
 
     def _update_action_buttons(self):
-        model_ok = self._model_is_loaded and self._backend is not None
+        model_ok = self._is_backend_loaded(self._backend)
         tab = self._tabs.currentIndex() if hasattr(self, '_tabs') else 0
         if tab == 1:
             file_ok = self.ebook_tab.has_fragments()
@@ -1502,22 +1510,49 @@ class MainWindow(QMainWindow):
         except Exception:
             return False
 
+    @staticmethod
+    def _speaker_ui_kind(model_id: Optional[str]) -> str:
+        if not model_id:
+            return "clone"
+        if model_id.startswith("supertonic_"):
+            return "supertonic"
+        if model_id == "piper":
+            return "piper"
+        if model_id == "veena":
+            return "veena"
+        if model_id == "maya1":
+            return "maya1"
+        if model_id == "maya2_native":
+            return "maya2"
+        return "clone"
+
     def _on_model_changed(self):
         if not hasattr(self, "_model_combo"):
             return
-        self._model_is_loaded = False
         self.undo_manager.clear()
         try:
             model_id = self._model_combo.currentData()
-            self._backend = create_backend(model_id)
+            prev_id = self._backend.model_id if self._backend is not None else None
+            if self._dubbing_mode and self._speaker_list and prev_id:
+                self._capture_speaker_voices_state(prev_id)
+
+            self._backend = self._get_backend(model_id)
+            loaded = self._is_backend_loaded(self._backend)
+
             self._refresh_fish_ui()
             self._update_params_visibility(model_id)
             self._update_whisper_visibility()
             self._update_voice_section_for_model(model_id)
             self._update_ref_text_visibility_for_model(model_id)
             self.srt_tab.update_dubbing_visibility()
+            if (
+                self._dubbing_mode
+                and self._speaker_list
+                and self._speaker_ui_kind(prev_id) != self._speaker_ui_kind(model_id)
+            ):
+                self._rebuild_voice_cloning_for_speakers()
             self._set_status(
-                f"{self._backend.display_name} selected — click 'Load model'."
+                f"{self._backend.display_name} selected — model is {'loaded' if loaded else 'ready to load'}."
             )
         except Exception as e:
             self._set_status(f"Backend error: {e}", C["error"])
@@ -1568,24 +1603,56 @@ class MainWindow(QMainWindow):
         result = {}
         is_supertonic = self._is_supertonic_active()
         is_piper = self._is_piper_active()
+        model_id = (
+            self._model_combo.currentData()
+            if hasattr(self, "_model_combo")
+            else None
+        )
+        is_veena = model_id == "veena"
+        is_maya = model_id == "maya1"
+        is_maya2 = model_id == "maya2_native"
+        any_builtin = False
         for spk in self._speaker_list:
             sv = self._speaker_voices.get(spk, {})
             if is_supertonic:
                 voice_combo = sv.get("voice_combo")
                 voice_name = voice_combo.currentData() if voice_combo else "M1"
                 result[spk] = (None, voice_name)
+            elif is_maya:
+                voice_combo = sv.get("voice_combo")
+                voice_name = voice_combo.currentData() if voice_combo else None
+                extra: Dict = {}
+                if voice_name == "custom":
+                    desc_wdg = sv.get("description")
+                    custom_desc = desc_wdg.toPlainText().strip() if desc_wdg else ""
+                    if custom_desc:
+                        extra["maya1_description"] = custom_desc
+                result[spk] = (None, voice_name, extra)
+            elif is_veena:
+                voice_combo = sv.get("voice_combo")
+                voice_name = voice_combo.currentData() if voice_combo else None
+                result[spk] = (None, voice_name)
             elif is_piper:
                 voice_combo = sv.get("voice_combo")
                 voice_model = voice_combo.currentData() if voice_combo else ""
                 result[spk] = (None, voice_model)
             else:
+                if is_maya2:
+                    voice_combo = sv.get("voice_combo")
+                    chosen = voice_combo.currentData() if voice_combo else "__clone__"
+                    if chosen and chosen != "__clone__":
+                        result[spk] = (None, chosen)
+                        any_builtin = True
+                        continue
                 drop = sv.get("drop")
                 ref_text_wdg = sv.get("ref_text")
                 audio_path = drop.file_path if drop else None
                 text = ref_text_wdg.toPlainText().strip() if ref_text_wdg else None
                 result[spk] = (audio_path, text or None)
-        if is_supertonic or is_piper:
+        if is_supertonic or is_piper or is_veena or is_maya:
             return result if result else None
+        if is_maya2 and any_builtin:
+            return result
         has_any_audio = any(v[0] for v in result.values())
         return result if has_any_audio else None
 
@@ -1648,73 +1715,132 @@ class MainWindow(QMainWindow):
         backend = self._backend
         if backend is None:
             return
+        if self._loading_model_ids:
+            self._set_status("Another model is currently loading.", C["warning"])
+            return
 
-        self._load_btn.setEnabled(False)
-        self._load_btn.setText("⚡  Loading…")
+        model_id = self._model_combo.currentData()
+        self._loading_model_ids.add(model_id)
         self._progress.setVisible(True)
         self._progress.setRange(0, 0)
-        self._model_lbl.setText("● Loading…")
-        self._model_lbl.setStyleSheet(
-            f"color:{C['warning']};font-size:11px;background:transparent;border:none;"
-        )
+        self._refresh_fish_ui()
+
+        def on_error(err: str, _mid=model_id):
+            self._on_error("Model load error", err,
+                reset_fn=lambda: (
+                    self._loading_model_ids.discard(_mid),
+                    self._progress.setVisible(False),
+                    self._refresh_fish_ui(),
+                ))
 
         self._w_load = LoadModelWorker(backend)
         self._w_load.status.connect(lambda m: self._set_status(m))
-        self._w_load.finished.connect(self._on_model_loaded)
-        self._w_load.error.connect(lambda e: self._on_error("Model load error", e,
-            reset_fn=lambda: (
-                self._load_btn.setEnabled(True),
-                self._load_btn.setText("⚡  Load model"),
-                self._progress.setVisible(False),
-                self._refresh_fish_ui(),
-            )))
+        self._w_load.finished.connect(
+            lambda _mid=model_id, _b=backend: self._on_model_loaded(_mid, _b)
+        )
+        self._w_load.error.connect(on_error)
         self._w_load.start()
 
-    def _on_model_loaded(self):
+    def _on_model_loaded(self, model_id: Optional[str] = None, backend=None):
+        if backend is None:
+            backend = self._backend
+        if model_id is None and hasattr(self, "_model_combo"):
+            model_id = self._model_combo.currentData()
+        self._loading_model_ids.discard(model_id)
         self._progress.setVisible(False)
+        if backend is not None and hasattr(backend, "_loaded"):
+            backend._loaded = True
         device_info = getattr(
-            self._backend, "device_info",
-            getattr(self._backend, "device", "")
+            backend, "device_info",
+            getattr(backend, "device", "")
         )
         self._set_status(f"Model ready — {device_info}", C["success"])
-        self._model_is_loaded = True
         self._refresh_fish_ui()
 
+    @staticmethod
+    def _release_gpu_memory() -> str:
+        gc.collect()
+        if not (TORCH_AVAILABLE and torch.cuda.is_available()):
+            return ""
+        try:
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            allocated = torch.cuda.memory_allocated() / (1024 ** 2)
+            reserved = torch.cuda.memory_reserved() / (1024 ** 2)
+            return f" VRAM in use: {allocated:.0f} MB allocated, {reserved:.0f} MB reserved."
+        except Exception:
+            return ""
+
+    def _other_loaded_models(self, current_id: Optional[str]) -> List[str]:
+        return [
+            mid for mid, b in self._backends_cache.items()
+            if mid != current_id and self._is_backend_loaded(b)
+        ]
+
     def _unload_fish_model(self):
-        if not self._backend or not self._model_is_loaded:
+        backend = self._backend
+        if backend is None or not self._is_backend_loaded(backend):
             return
 
-        model_name = self._backend.name
+        model_id = self._model_combo.currentData()
+        if model_id in self._unloading_model_ids:
+            return
+
         if QMessageBox.question(
             self,
             "Unload model",
-            f"Unload {model_name} from GPU memory?\n\nYou will need to reload it before generating.",
+            f"Unload {backend.name} from GPU memory?\n\nYou will need to reload it before generating.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
             return
 
-        self._unload_btn.setEnabled(False)
-        self._unload_btn.setText("⏳  Unloading…")
+        self._unloading_model_ids.add(model_id)
+        self._refresh_fish_ui()
         stop_play(self)
 
+        messages: list = []
+        errors: list = []
+        details: list = []
+
         def do_unload():
-            self._backend.unload_model(lambda m: self._set_status(m))
+            try:
+                backend.unload_model(lambda m: messages.append(m))
+            except Exception as e:
+                errors.append(str(e))
+            details.append(self._release_gpu_memory())
 
         t = threading.Thread(target=do_unload, daemon=True)
         t.start()
 
+        def flush_messages():
+            last = None
+            while messages:
+                last = messages.pop(0)
+            if last is not None:
+                self._set_status(last)
+
         def poll():
+            flush_messages()
             if t.is_alive():
                 QTimer.singleShot(100, poll)
+                return
+            self._unloading_model_ids.discard(model_id)
+            if errors:
+                self._set_status(f"Unload error: {errors[0]}", C["error"])
             else:
-                self._unload_btn.setEnabled(True)
-                self._unload_btn.setText("🗑  Unload")
+                if hasattr(backend, "_loaded"):
+                    backend._loaded = False
+                suffix = details[0] if details else ""
+                others = self._other_loaded_models(model_id)
+                if others:
+                    suffix += " Still loaded: " + ", ".join(others) + "."
                 self._set_status(
-                    "Model unloaded — reload before generating.",
+                    "Model unloaded — reload before generating." + suffix,
                     C["warning"],
                 )
-                self._model_is_loaded = False
-                self._refresh_fish_ui()
+            self._refresh_fish_ui()
 
         QTimer.singleShot(100, poll)
 
@@ -2099,7 +2225,26 @@ class MainWindow(QMainWindow):
                 return token
         return None
 
-    def _rebuild_voice_cloning_for_speakers(self):
+    def _capture_speaker_voices_state(self, model_id: str):
+        if not model_id or not self._speaker_voices:
+            return
+        if not hasattr(self, "_speaker_voices_cache"):
+            self._speaker_voices_cache = {}
+        state = {}
+        for spk, sv in self._speaker_voices.items():
+            entry = {}
+            vc = sv.get("voice_combo")
+            if vc is not None:
+                entry["voice"] = vc.currentData()
+            desc = sv.get("description")
+            if desc is not None:
+                entry["description"] = desc.toPlainText()
+            if entry:
+                state[spk] = entry
+        if state:
+            self._speaker_voices_cache[model_id] = state
+
+    def _rebuild_voice_cloning_for_speakers_base(self):
         while self._speakers_lay.count():
             item = self._speakers_lay.takeAt(0)
             if item.widget():
@@ -2108,6 +2253,13 @@ class MainWindow(QMainWindow):
         self._speaker_voices.clear()
         is_supertonic = self._is_supertonic_active()
         is_piper = self._is_piper_active()
+        model_id = (
+            self._model_combo.currentData()
+            if hasattr(self, "_model_combo")
+            else None
+        )
+        is_veena = model_id == "veena"
+        is_maya = model_id == "maya1"
 
         for spk in self._speaker_list:
             spk_group = QGroupBox(f"🎤  {spk}")
@@ -2156,6 +2308,90 @@ class MainWindow(QMainWindow):
                 spk_lay.addWidget(hint_lbl)
 
                 self._speaker_voices[spk] = {"voice_combo": voice_combo}
+
+            elif is_veena:
+                voice_row = QHBoxLayout()
+                voice_row.setSpacing(8)
+                voice_lbl = QLabel("Voice:")
+                voice_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
+                voice_lbl.setFixedWidth(44)
+                voice_combo = QComboBox()
+                voice_opts = getattr(self._backend, "speaker_voice_options", [])
+                for vcode, vdisplay in voice_opts:
+                    voice_combo.addItem(vdisplay, vcode)
+                if voice_opts:
+                    voice_combo.setCurrentIndex(0)
+                voice_row.addWidget(voice_lbl)
+                voice_row.addWidget(voice_combo, 1)
+                spk_lay.addLayout(voice_row)
+
+                hint_lbl = QLabel(
+                    "Veena uses built-in speakers only. Select a voice for this speaker."
+                )
+                hint_lbl.setStyleSheet(
+                    f"color:{C['text3']};font-size:10px;font-style:italic;"
+                )
+                hint_lbl.setWordWrap(True)
+                spk_lay.addWidget(hint_lbl)
+
+                self._speaker_voices[spk] = {"voice_combo": voice_combo}
+
+            elif is_maya:
+                voice_row = QHBoxLayout()
+                voice_row.setSpacing(8)
+                voice_lbl = QLabel("Voice:")
+                voice_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
+                voice_lbl.setFixedWidth(44)
+                voice_combo = QComboBox()
+                voice_opts = getattr(self._backend, "speaker_voice_options", [])
+                for vcode, vdisplay in voice_opts:
+                    voice_combo.addItem(vdisplay, vcode)
+                if voice_opts:
+                    voice_combo.setCurrentIndex(0)
+                voice_row.addWidget(voice_lbl)
+                voice_row.addWidget(voice_combo, 1)
+                spk_lay.addLayout(voice_row)
+
+                desc_lbl = QLabel("Custom description:")
+                desc_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
+                description = QPlainTextEdit()
+                description.setPlaceholderText(
+                    "Describe the desired voice for this speaker…"
+                )
+                description.setFixedHeight(52)
+                description.setFont(QFont("Segoe UI", 11))
+                description.setToolTip(
+                    "Used when Voice = 'Custom description'.\n"
+                    "Example: 'Female, in her 30s with an American accent, energetic, clear diction'.\n"
+                    "Inline tokens like <laugh>, <whisper>, <sigh>, <cry> are supported."
+                )
+
+                desc_row = QWidget()
+                desc_row_lay = QVBoxLayout(desc_row)
+                desc_row_lay.setContentsMargins(0, 0, 0, 0)
+                desc_row_lay.setSpacing(2)
+                desc_row_lay.addWidget(desc_lbl)
+                desc_row_lay.addWidget(description)
+                desc_row.setVisible(False)
+                spk_lay.addWidget(desc_row)
+
+                def _on_maya_voice_changed(_idx=None, _row=desc_row, _combo=voice_combo):
+                    _row.setVisible(_combo.currentData() == "custom")
+                voice_combo.currentIndexChanged.connect(_on_maya_voice_changed)
+
+                hint_lbl = QLabel(
+                    "Maya-1 uses voice description presets. Select a preset or 'Custom description' for this speaker."
+                )
+                hint_lbl.setStyleSheet(
+                    f"color:{C['text3']};font-size:10px;font-style:italic;"
+                )
+                hint_lbl.setWordWrap(True)
+                spk_lay.addWidget(hint_lbl)
+
+                self._speaker_voices[spk] = {
+                    "voice_combo": voice_combo,
+                    "description": description,
+                }
 
             elif is_piper:
                 voice_row = QHBoxLayout()
@@ -2365,6 +2601,21 @@ class MainWindow(QMainWindow):
 
             self._speakers_lay.addWidget(spk_group)
 
+        cached = getattr(self, "_speaker_voices_cache", {}).get(model_id or "", {})
+        if cached:
+            for spk, sv in self._speaker_voices.items():
+                c = cached.get(spk)
+                if not c:
+                    continue
+                vc = sv.get("voice_combo")
+                if vc is not None and "voice" in c:
+                    idx = vc.findData(c["voice"])
+                    if idx >= 0:
+                        vc.setCurrentIndex(idx)
+                desc = sv.get("description")
+                if desc is not None and "description" in c:
+                    desc.setPlainText(c["description"])
+
         self._voice_single_container.setVisible(False)
         self._speakers_container.setVisible(True)
 
@@ -2373,6 +2624,66 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "_voice_cloning_section"):
             self._voice_cloning_section.expand()
+
+    def _rebuild_voice_cloning_for_speakers(self):
+        self._rebuild_voice_cloning_for_speakers_base()
+
+        model_id = (
+            self._model_combo.currentData()
+            if hasattr(self, "_model_combo")
+            else None
+        )
+        if model_id != "maya2_native":
+            return
+
+        voice_opts = getattr(self._backend, "speaker_voice_options", [])
+        cached = getattr(self, "_speaker_voices_cache", {}).get(model_id, {})
+
+        for idx, spk in enumerate(self._speaker_list):
+            item = self._speakers_lay.itemAt(idx)
+            sv = self._speaker_voices.get(spk)
+            if item is None or item.widget() is None or sv is None:
+                continue
+            group = item.widget()
+            group_lay = group.layout()
+            tab_widget = group.findChild(QTabWidget)
+            if group_lay is None or tab_widget is None:
+                continue
+
+            voice_row = QHBoxLayout()
+            voice_row.setSpacing(8)
+            voice_lbl = QLabel("Voice:")
+            voice_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
+            voice_lbl.setFixedWidth(44)
+            voice_combo = QComboBox()
+            voice_combo.addItem("🎙 Voice cloning (reference audio)", "__clone__")
+            for vcode, vdisplay in voice_opts:
+                voice_combo.addItem(vdisplay, vcode)
+            voice_row.addWidget(voice_lbl)
+            voice_row.addWidget(voice_combo, 1)
+            group_lay.insertLayout(0, voice_row)
+
+            hint_lbl = QLabel(
+                "Choose a built-in voice or clone a voice from reference audio."
+            )
+            hint_lbl.setStyleSheet(
+                f"color:{C['text3']};font-size:10px;font-style:italic;"
+            )
+            hint_lbl.setWordWrap(True)
+            group_lay.insertWidget(1, hint_lbl)
+
+            def _on_voice_source_changed(_idx=None, _combo=voice_combo, _tabs=tab_widget):
+                _tabs.setVisible(_combo.currentData() == "__clone__")
+
+            state = cached.get(spk)
+            if state and "voice" in state:
+                found = voice_combo.findData(state["voice"])
+                if found >= 0:
+                    voice_combo.setCurrentIndex(found)
+
+            voice_combo.currentIndexChanged.connect(_on_voice_source_changed)
+            _on_voice_source_changed()
+            sv["voice_combo"] = voice_combo
 
     def _on_speaker_ref_dropped(self, speaker: str, path: str):
         sv = self._speaker_voices.get(speaker)
