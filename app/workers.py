@@ -34,7 +34,7 @@ except ImportError as _torch_import_error:
 
 from config import WHISPER_REPOS, WHISPER_SIZE_MB, ROOT_DIR, OUTPUTS_DIR, WHISPER_DIR
 from utils import _normalize_text_for_tts, _get_wav_duration, _fmt, _fmt_ms, _check_ffmpeg
-from tts_backends import InferenceError  # <-- dodany brakujący import
+from tts_backends import InferenceError
 
 logger = logging.getLogger(__name__)
 
@@ -155,17 +155,25 @@ class TTSWorker(QThread):
 
             self.progress.emit(idx, f"Synthesizing fragment {idx + 1}…", False)
 
+            extra_settings: Dict = {}
             if self.speaker_voices:
                 speaker = fragment.get("speaker") or ""
                 sv = self.speaker_voices.get(speaker) if speaker else None
                 if sv:
-                    ref_audio, ref_text = sv
+                    if len(sv) >= 3:
+                        ref_audio, ref_text, extra_settings = sv[0], sv[1], sv[2] or {}
+                    else:
+                        ref_audio, ref_text = sv[0], sv[1]
                 else:
                     ref_audio = self.reference_audio
                     ref_text  = self.reference_text
             else:
                 ref_audio = self.reference_audio
                 ref_text  = self.reference_text
+
+            merged_settings = dict(self.generation_settings)
+            if extra_settings:
+                merged_settings.update(extra_settings)
 
             start_ms = fragment.get("start_ms", 0) or 0
             end_ms   = fragment.get("end_ms", 0) or 0
@@ -199,7 +207,7 @@ class TTSWorker(QThread):
                             reference_audio_path=ref_audio,
                             reference_text=ref_text,
                             progress_cb=lambda m, _i=idx: self.progress.emit(_i, m, False),
-                            **self.generation_settings,
+                            **merged_settings,
                         )
 
                         min_samples = max(1, int(sr * 0.05))
