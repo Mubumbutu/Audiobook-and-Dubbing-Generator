@@ -5,7 +5,7 @@ from typing import List
 
 from input_formats import (
     InputFormat, Segment, register_format,
-    _NOISE_RE, _local_tag, _clean_text, _split_sentences,
+    _NOISE_RE, _local_tag, _clean_text, _split_sentences, _merge_continuations,
 )
 
 _BLOCK_TAGS = frozenset({
@@ -80,7 +80,7 @@ class EpubFormat(InputFormat):
     def description(self) -> str:
         return "EPUB e-book file (.epub)"
 
-    def load(self, path: str) -> List[Segment]:
+    def load(self, path: str, merge_continuations: bool = True) -> List[Segment]:
         try:
             from lxml import etree
         except ImportError as e:
@@ -119,7 +119,7 @@ class EpubFormat(InputFormat):
                         continue
                     if _NOISE_RE.fullmatch(text):
                         continue
-                    for sentence in _split_sentences(text):
+                    for sentence in _split_sentences(text, merge_orphans=merge_continuations):
                         segments.append(Segment(
                             index=idx,
                             start_ms=0,
@@ -129,6 +129,8 @@ class EpubFormat(InputFormat):
                         ))
                         idx += 1
 
+        if merge_continuations:
+            return _merge_continuations(segments)
         return segments
 
     def save(self, segments: List[Segment], path: str) -> None:
