@@ -23,6 +23,7 @@ _SENTENCE_SPLIT_RE = re.compile(
     r'(?<=[.!?…])\s+'
     r'(?=[A-Z\u00C0-\u00D6\u00D8-\u00DE\u0410-\u042F\u0401„""«»\u2018\u2019])'
 )
+_SENTENCE_END_RE = re.compile(r'[.!?…]\s*$')
 
 
 def _local_tag(tag: str) -> str:
@@ -35,7 +36,7 @@ def _clean_text(text: str) -> str:
     return _WHITESPACE_RE.sub(' ', text).strip()
 
 
-def _split_sentences(text: str) -> List[str]:
+def _split_sentences(text: str, merge_orphans: bool = True) -> List[str]:
     if not text or len(text) < 5:
         return [text] if text else []
 
@@ -46,13 +47,12 @@ def _split_sentences(text: str) -> List[str]:
         part = part.strip()
         if not part or _NOISE_RE.fullmatch(part):
             continue
-        if len(part) >= 5:
-            result.append(part)
+        result.append(part)
 
-    if len(result) > 1:
+    if merge_orphans and len(result) > 1:
         final = [result[0]]
         for part in result[1:]:
-            if len(final[-1]) < 8:
+            if not _SENTENCE_END_RE.search(final[-1]):
                 final[-1] = final[-1] + ' ' + part
             else:
                 final.append(part)
@@ -61,15 +61,30 @@ def _split_sentences(text: str) -> List[str]:
     return result or [text]
 
 
-def _is_continuation_start(ch: str) -> bool:
-    if not ch or not ch.isalpha():
+_PRONOUN_I_RE = re.compile(r"^I\b")
+
+
+def _is_continuation_start(text: str) -> bool:
+    text = text.lstrip()
+    if not text:
         return False
+    ch = text[0]
+    if ch.isdigit():
+        return True
+    if not ch.isalpha():
+        return True
     if ch.lower() == ch.upper():
         return True
-    return ch.islower()
+    if ch.islower():
+        return True
+    return bool(_PRONOUN_I_RE.match(text))
 
 
-def _merge_continuations(segments: List[Segment], max_gap_ms: int = 1000) -> List[Segment]:
+def _merge_continuations(
+    segments: List[Segment],
+    max_gap_ms: int = 1000,
+    min_len: int = 5,
+) -> List[Segment]:
     if not segments:
         return segments
 
@@ -80,19 +95,23 @@ def _merge_continuations(segments: List[Segment], max_gap_ms: int = 1000) -> Lis
         while i + 1 < len(segments):
             nxt = segments[i + 1]
             gap = nxt.start_ms - seg.end_ms
+            a_text = seg.text.strip() if seg.text else ''
+            b_text = nxt.text.strip() if nxt.text else ''
+            same_speaker = seg.speaker == nxt.speaker
             if (
                 gap <= max_gap_ms
-                and seg.text
-                and nxt.text
-                and seg.text[-1] not in '.?!…'
-                and _is_continuation_start(nxt.text[0])
+                and len(a_text) >= min_len
+                and len(b_text) >= min_len
+                and a_text[-1] not in '.?!…'
+                and _is_continuation_start(b_text)
+                and same_speaker
             ):
                 seg = Segment(
                     index=seg.index,
                     start_ms=seg.start_ms,
                     end_ms=nxt.end_ms,
-                    text=seg.text + ' ' + nxt.text,
-                    speaker=seg.speaker if seg.speaker is not None else nxt.speaker,
+                    text=a_text + ' ' + b_text,
+                    speaker=seg.speaker if seg.speaker else nxt.speaker,
                 )
                 i += 1
             else:
@@ -126,7 +145,7 @@ class InputFormat(ABC):
     def description(self) -> str: ...
 
     @abstractmethod
-    def load(self, path: str) -> List[Segment]: ...
+    def load(self, path: str, merge_continuations: bool = True) -> List[Segment]: ...
 
     @abstractmethod
     def save(self, segments: List[Segment], path: str) -> None: ...
