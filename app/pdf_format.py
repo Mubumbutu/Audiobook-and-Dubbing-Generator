@@ -5,7 +5,7 @@ from typing import List
 
 from input_formats import (
     InputFormat, Segment, register_format,
-    _NOISE_RE, _clean_text, _split_sentences,
+    _NOISE_RE, _clean_text, _split_sentences, _merge_continuations,
 )
 
 _SENTENCE_END_RE = re.compile(r'[.!?…]\s*$')
@@ -62,7 +62,7 @@ class PdfFormat(InputFormat):
     def description(self) -> str:
         return "PDF document (.pdf)"
 
-    def load(self, path: str) -> List[Segment]:
+    def load(self, path: str, merge_continuations: bool = True) -> List[Segment]:
         try:
             import fitz
         except ImportError as e:
@@ -87,7 +87,7 @@ class PdfFormat(InputFormat):
         segments: List[Segment] = []
         idx = 0
         for text in _merge_broken_sentences(raw_blocks):
-            for sentence in _split_sentences(text):
+            for sentence in _split_sentences(text, merge_orphans=merge_continuations):
                 segments.append(Segment(
                     index=idx,
                     start_ms=0,
@@ -97,6 +97,8 @@ class PdfFormat(InputFormat):
                 ))
                 idx += 1
 
+        if merge_continuations:
+            return _merge_continuations(segments)
         return segments
 
     def save(self, segments: List[Segment], path: str) -> None:
