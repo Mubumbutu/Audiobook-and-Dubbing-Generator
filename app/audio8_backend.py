@@ -18,7 +18,10 @@ from huggingface_hub import snapshot_download
 logger = logging.getLogger(__name__)
 
 _ROOT_DIR = Path(__file__).parent.parent
-MODEL_REPO = "AutoArk-AI/Audio8-TTS-Preview-0.6b"
+PREVIEW_REPO = "AutoArk-AI/Audio8-TTS-Preview-0.6b"
+REALISTIC_REPO = "Edge0/Audio8-TTS-Realistic-0.6b"
+PREVIEW_DIR = _ROOT_DIR / "models" / "audio8"
+REALISTIC_DIR = _ROOT_DIR / "models" / "audio8_realistic"
 DEFAULT_SR = 44100
 
 _AUDIO8_PARAMS: List[Dict[str, Any]] = [
@@ -56,6 +59,8 @@ class InferenceError(Exception):
 
 class _Audio8Base(TTSBackend):
 
+    _REPO: str = PREVIEW_REPO
+
     def __init__(self, model_dir: Path, dtype: torch.dtype):
         self.model_dir = Path(model_dir)
         self.dtype     = dtype
@@ -85,6 +90,10 @@ class _Audio8Base(TTSBackend):
     @property
     def header_title(self) -> str:
         return "Audio8 TTS"
+
+    @property
+    def download_repo(self) -> str:
+        return self._REPO
 
     @property
     def generation_params(self) -> List[Dict[str, Any]]:
@@ -119,8 +128,8 @@ class _Audio8Base(TTSBackend):
     ) -> None:
         model_dir.mkdir(parents=True, exist_ok=True)
         if progress_cb:
-            progress_cb(f"Downloading {MODEL_REPO}…", 0.0)
-        snapshot_download(repo_id=MODEL_REPO, local_dir=str(model_dir))
+            progress_cb(f"Downloading {self._REPO}…", 0.0)
+        snapshot_download(repo_id=self._REPO, local_dir=str(model_dir))
         self._marker.touch(exist_ok=True)
         if progress_cb:
             progress_cb("Model downloaded successfully!", 1.0)
@@ -166,7 +175,7 @@ class _Audio8Base(TTSBackend):
             )
 
         status(
-            f"Loading Audio8 TTS from {self.model_dir} "
+            f"Loading {self.name} from {self.model_dir} "
             f"| dtype: {self.dtype} | device: {self.device}"
         )
         status("  (first load may take 1–3 min)")
@@ -300,11 +309,19 @@ class _Audio8Base(TTSBackend):
         return arr.astype(np.float32), sample_rate
 
 
+class _Audio8PreviewBase(_Audio8Base):
+    _REPO = PREVIEW_REPO
+
+
+class _Audio8RealisticBase(_Audio8Base):
+    _REPO = REALISTIC_REPO
+
+
 @register_backend
-class Audio8Bf16Backend(_Audio8Base):
+class Audio8Bf16Backend(_Audio8PreviewBase):
 
     def __init__(self):
-        super().__init__(_ROOT_DIR / "models" / "audio8", torch.bfloat16)
+        super().__init__(PREVIEW_DIR, torch.bfloat16)
 
     @property
     def name(self) -> str:
@@ -316,11 +333,7 @@ class Audio8Bf16Backend(_Audio8Base):
 
     @property
     def display_name(self) -> str:
-        return "🎧 Audio8 TTS bfloat16"
-
-    @property
-    def download_repo(self) -> str:
-        return MODEL_REPO
+        return "🎧 Audio8 TTS Preview bfloat16"
 
     @property
     def download_size(self) -> str:
@@ -328,10 +341,10 @@ class Audio8Bf16Backend(_Audio8Base):
 
 
 @register_backend
-class Audio8Fp32Backend(_Audio8Base):
+class Audio8Fp32Backend(_Audio8PreviewBase):
 
     def __init__(self):
-        super().__init__(_ROOT_DIR / "models" / "audio8", torch.float32)
+        super().__init__(PREVIEW_DIR, torch.float32)
 
     @property
     def name(self) -> str:
@@ -343,11 +356,53 @@ class Audio8Fp32Backend(_Audio8Base):
 
     @property
     def display_name(self) -> str:
-        return "🔵 Audio8 TTS float32"
+        return "🔵 Audio8 TTS Preview float32"
 
     @property
-    def download_repo(self) -> str:
-        return MODEL_REPO
+    def download_size(self) -> str:
+        return "~3.5 GB"
+
+
+@register_backend
+class Audio8RealisticBf16Backend(_Audio8RealisticBase):
+
+    def __init__(self):
+        super().__init__(REALISTIC_DIR, torch.bfloat16)
+
+    @property
+    def name(self) -> str:
+        return "Audio8 TTS Realistic 0.6B bfloat16"
+
+    @property
+    def model_id(self) -> str:
+        return "audio8_realistic_bf16"
+
+    @property
+    def display_name(self) -> str:
+        return "✨ Audio8 TTS Realistic bfloat16"
+
+    @property
+    def download_size(self) -> str:
+        return "~2 GB"
+
+
+@register_backend
+class Audio8RealisticFp32Backend(_Audio8RealisticBase):
+
+    def __init__(self):
+        super().__init__(REALISTIC_DIR, torch.float32)
+
+    @property
+    def name(self) -> str:
+        return "Audio8 TTS Realistic 0.6B float32"
+
+    @property
+    def model_id(self) -> str:
+        return "audio8_realistic_fp32"
+
+    @property
+    def display_name(self) -> str:
+        return "🔷 Audio8 TTS Realistic float32"
 
     @property
     def download_size(self) -> str:
