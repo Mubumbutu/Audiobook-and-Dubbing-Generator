@@ -24,26 +24,28 @@ if not exist "app\main.py" (
     exit /b 1
 )
 
+set "LABEL_venv_audio8=Audio8 TTS Preview and Realistic 0.6B"
 set "LABEL_venv_chatterbox=Chatterbox TTS"
 set "LABEL_venv_fish_s2_pro=Fish Audio Speech-2 Pro"
+set "LABEL_venv_higgs_wsl=Higgs TTS 3 (WSL2)"
+set "LABEL_venv_kitten2=KittenTTS 2"
+set "LABEL_venv_maya2=Maya 2 Native"
+set "LABEL_venv_maya_veena=Maya 1 + Veena TTS"
+set "LABEL_venv_ming3=Ming-3.0-tts 0.5B"
 set "LABEL_venv_moss=MOSS TTS"
 set "LABEL_venv_omnivoice=OmniVoice"
+set "LABEL_venv_piper=Piper TTS"
 set "LABEL_venv_qwen3=Qwen3 TTS"
+set "LABEL_venv_supertonic=Supertonic 3"
 set "LABEL_venv_tada=TADA TTS"
 set "LABEL_venv_voxcpm2=VoxCPM 2"
-set "LABEL_venv_supertonic=Supertonic 3"
-set "LABEL_venv_piper=Piper TTS"
 set "LABEL_venv_xttsv2=XTTS v2"
-set "LABEL_venv_higgs_wsl=Higgs TTS 3 (WSL2)"
-set "LABEL_venv_audio8=Audio8 TTS Preview 0.6B"
-set "LABEL_venv_kitten2=KittenTTS 2"
-set "LABEL_venv_ming3=Ming-3.0-tts 0.5B"
 
 set COUNT=0
-for /d %%D in ("venvs\*") do (
-    if exist "venvs\%%~nxD\Scripts\activate.bat" (
+for /f "delims=" %%D in ('dir /b /ad /on "venvs" 2^>nul') do (
+    if exist "venvs\%%D\Scripts\activate.bat" (
         set /a COUNT+=1
-        set "VENV_!COUNT!=%%~nxD"
+        set "VENV_!COUNT!=%%D"
     )
 )
 
@@ -85,10 +87,6 @@ if !CHOICE_NUM! GTR !COUNT! (
 
 set "SELECTED=!VENV_%CHOICE_NUM%!"
 set "ACTIVATE=venvs\!SELECTED!\Scripts\activate.bat"
-if /i "!SELECTED!"=="venv_kitten2" (
-    set PYTHONUTF8=1
-    set PYTHONIOENCODING=utf-8
-)
 
 echo.
 echo [OK] Selected : !SELECTED!
