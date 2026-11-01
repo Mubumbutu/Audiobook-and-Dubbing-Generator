@@ -4,7 +4,7 @@ import importlib
 import os
 import sys
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable, Dict, List, Optional
@@ -23,6 +23,7 @@ class SynthesisRequest:
     repetition_penalty: float = 1.2
     max_new_tokens: int = 1024
     chunk_length: int = 200
+    extra: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
