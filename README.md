@@ -4,7 +4,7 @@
 
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.0.0-blue" />
+  <img alt="Version" src="https://img.shields.io/badge/version-1.1.0-blue" />
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white" />
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-lightgrey" />
   <img alt="CUDA" src="https://img.shields.io/badge/CUDA-11.8%20%7C%2012.1%20%7C%2012.4-76b900?logo=nvidia&logoColor=white" />
@@ -35,6 +35,17 @@ A desktop application for AI-powered text-to-speech synthesis, Lektor-style audi
 <summary><b>Version history</b> (click to expand)</summary>
 
 <br>
+
+### [1.1.0] - 2026-11-01
+**Added**
+- Added 4 new models: Veena, Maya1, Maya2, and Audio 8 Realistic 0.6b.
+
+**Changed**
+- Updated file loading for the Ebook Fragments tab. In addition to splitting text into individual sentences, it now also merges sentences that were split.
+- Modified the `Del` keyboard shortcut. It can now also select Mute instead of requiring a dedicated shortcut, improving convenience.
+
+**Fixed**
+- Minor fixes and improvements.
 
 ### [1.0.0] - 2026-10-23
 **Added**
@@ -121,6 +132,10 @@ The app supports multiple TTS backends. Available backends are detected automati
 | Ming 3.0 TTS | [huggingface.co/inclusionAI/Ming-3.0-tts-0.5b](https://huggingface.co/inclusionAI/Ming-3.0-tts-0.5b) |
 | Kitten TTS 2 | [huggingface.co/KittenML/kitten-tts-2](https://huggingface.co/KittenML/kitten-tts-2) |
 | Audio8 TTS Preview | [huggingface.co/Edge0/Audio8-TTS-Preview-0.6b](https://huggingface.co/Edge0/Audio8-TTS-Preview-0.6b) |
+| Audio8 TTS Realistic 0.6b | [huggingface.co/Edge0/Audio8-TTS-Realistic-0.6b](https://huggingface.co/Edge0/Audio8-TTS-Realistic-0.6b) |
+| Veena | [huggingface.co/maya-research/Veena](https://huggingface.co/maya-research/Veena) |
+| Maya1 | [huggingface.co/maya-research/maya1](https://huggingface.co/maya-research/maya1) |
+| Maya2 Native | [huggingface.co/maya-research/maya2-native](https://huggingface.co/maya-research/maya2-native) |
 
 Most backends support **voice cloning** via a reference audio file. You can upload a reference `.wav`, optionally pre-process it (resample, convert to mono, normalize, isolate vocals via Demucs), and optionally transcribe it using Whisper before synthesis.
 
