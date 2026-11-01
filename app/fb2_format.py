@@ -4,7 +4,7 @@ from typing import List
 
 from input_formats import (
     InputFormat, Segment, register_format,
-    _NOISE_RE, _local_tag, _clean_text, _split_sentences,
+    _NOISE_RE, _local_tag, _clean_text, _split_sentences, _merge_continuations,
 )
 
 _BLOCK_TAGS = frozenset({
@@ -27,7 +27,7 @@ class Fb2Format(InputFormat):
     def description(self) -> str:
         return "FictionBook 2 e-book (.fb2)"
 
-    def load(self, path: str) -> List[Segment]:
+    def load(self, path: str, merge_continuations: bool = True) -> List[Segment]:
         import xml.etree.ElementTree as ET
 
         try:
@@ -61,7 +61,7 @@ class Fb2Format(InputFormat):
         segments: List[Segment] = []
         idx = 0
         for text in raw_texts:
-            for sentence in _split_sentences(text):
+            for sentence in _split_sentences(text, merge_orphans=merge_continuations):
                 segments.append(Segment(
                     index=idx,
                     start_ms=0,
@@ -71,6 +71,8 @@ class Fb2Format(InputFormat):
                 ))
                 idx += 1
 
+        if merge_continuations:
+            return _merge_continuations(segments)
         return segments
 
     def save(self, segments: List[Segment], path: str) -> None:
