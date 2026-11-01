@@ -6,7 +6,7 @@ from typing import List
 
 from input_formats import (
     InputFormat, Segment, register_format,
-    _NOISE_RE, _local_tag, _clean_text, _split_sentences,
+    _NOISE_RE, _local_tag, _clean_text, _split_sentences, _merge_continuations,
 )
 
 _BLOCK_TAGS = frozenset({
@@ -61,7 +61,7 @@ class KindleFormat(InputFormat):
     def description(self) -> str:
         return "Kindle e-book file (.mobi, .azw, .azw3) – read only"
 
-    def load(self, path: str) -> List[Segment]:
+    def load(self, path: str, merge_continuations: bool = True) -> List[Segment]:
         try:
             import mobi
         except ImportError as e:
@@ -79,7 +79,7 @@ class KindleFormat(InputFormat):
             idx = 0
             for html_path in html_files:
                 for text in _parse_html_file(html_path):
-                    for sentence in _split_sentences(text):
+                    for sentence in _split_sentences(text, merge_orphans=merge_continuations):
                         segments.append(Segment(
                             index=idx,
                             start_ms=0,
@@ -91,6 +91,8 @@ class KindleFormat(InputFormat):
         finally:
             shutil.rmtree(extract_dir, ignore_errors=True)
 
+        if merge_continuations:
+            return _merge_continuations(segments)
         return segments
 
     def save(self, segments: List[Segment], path: str) -> None:
