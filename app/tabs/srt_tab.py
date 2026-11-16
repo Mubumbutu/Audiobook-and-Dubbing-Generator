@@ -3,6 +3,7 @@
 SRT tab implementation – subtitle loading, fragment management,
 synthesis, dubbing, and Lektor video export.
 """
+import copy
 import os
 import re
 import json
@@ -28,11 +29,11 @@ from PyQt6.QtWidgets import (
     QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox, QSlider,
     QSplitter, QMenu, QDialog, QDialogButtonBox, QInputDialog,
     QMessageBox, QFrame, QSizePolicy, QScrollArea, QRadioButton,
-    QApplication, QTabWidget,
+    QApplication, QTabWidget, QAbstractItemView,
 )
 from PyQt6.QtCore import Qt, QTimer, QUrl, QFileSystemWatcher
 from PyQt6.QtGui import (
-    QFont, QColor, QIcon, QAction, QDesktopServices, QPen,
+    QFont, QColor, QIcon, QAction, QDesktopServices, QPen, QBrush,
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -49,7 +50,10 @@ from config import (
     SUPERTONIC_VOICES, _piper_voice_options,
     MODEL_OPTIONS, _ACTIVE_BACKEND_CLASSES,
 )
-from widgets import FragmentTreeWidget, DropAudioWidget, RefAudioPlayer, CollapsibleSection
+from widgets import (
+    FragmentTreeWidget, DropAudioWidget, RefAudioPlayer, CollapsibleSection,
+    ClickableVideoWidget, VideoFullscreenWindow,
+)
 from utils import (
     _get_last_dir, _set_last_dir,
     _detect_srt_language, _convert_numbers_in_text,
@@ -63,10 +67,12 @@ from workers import (
     TranscribeWorker, AudioProcessWorker,
     VideoAudioExtractWorker, LektorExportThread, VocalSuppressWorker,
 )
-from input_formats import get_format
+from input_formats import get_format, supported_extensions
+import ass_format
 from txt_format import txt_srt_format
 from tts_backends import InferenceError
-from session_manager import _write_session_to as write_session_to, _restore_session_data as restore_session_data
+from session_manager import _write_session_to as write_session_to, _restore_session_data as restore_session_data, choose_session_file
+from undo_manager import snapshot_fragments, restore_snapshot_files, discard_snapshot, move_to_trash
 
 logger = logging.getLogger(__name__)
 
@@ -182,13 +188,14 @@ class SrtTab(BaseTab):
         self._media_player.mediaStatusChanged.connect(self._on_media_status_changed)
 
     def set_shared_widgets(self, btn_start, btn_stop, synth_progress, eta_label, progress, norm_check):
-        """Ustawia widżety współdzielone z MainWindow."""
+        """Set widgets shared with MainWindow."""
         self._btn_start = btn_start
         self._btn_stop = btn_stop
         self._synth_progress = synth_progress
         self._eta_label = eta_label
         self._progress = progress
         self._norm_check = norm_check
+        self._tree.itemChanged.connect(self._on_item_check_changed)
 
     def get_widget(self) -> QWidget:
         """Return the built tab widget."""
@@ -205,7 +212,7 @@ class SrtTab(BaseTab):
         lay.setSpacing(6)
 
         top = QHBoxLayout()
-        self._btn_load_srt = QPushButton("📂  Load SRT / TXT")
+        self._btn_load_srt = QPushButton("📂  Load File")
         self._btn_load_srt.clicked.connect(self._load_srt_file)
         self._btn_close_srt = QPushButton("✕  Close")
         self._btn_close_srt.setEnabled(False)
@@ -289,21 +296,20 @@ class SrtTab(BaseTab):
         )
         sel_overlong.clicked.connect(self._show_timing_issues_dialog)
 
-        btn_snap_timing = QPushButton("⏱ Snap")
-        btn_snap_timing.setFixedHeight(26)
-        btn_snap_timing.setStyleSheet("font-size:11px;padding:2px 8px;")
-        btn_snap_timing.setToolTip(
-            "Snap end times to next fragment's start time.\n\n"
-            "Example:\n"
-            "  Fragment 1: 9:24.100 → 9:29.000\n"
-            "  Fragment 2: 9:29.200 → 9:31.100\n"
-            "After snap:\n"
-            "  Fragment 1: 9:24.100 → 9:29.200\n"
-            "  Fragment 2: 9:29.200 → 9:31.200\n"
-            "  (last fragment end time is not changed)\n\n"
-            "Removes gaps between consecutive fragments."
+        btn_time_corrector = QPushButton("⏱ Time corrector")
+        btn_time_corrector.setFixedHeight(26)
+        btn_time_corrector.setStyleSheet("font-size:11px;padding:2px 8px;")
+        btn_time_corrector.setToolTip(
+            "Review all overlapping fragments and choose for each one:\n"
+            "  - merge the fragments,\n"
+            "  - keep them separate.\n\n"
+            "Then choose the subtitle timing:\n"
+            "  - overlap allowed (good for dubbing) - gaps are closed, overlapping fragments are not changed,\n"
+            "  - no overlap (good for lektor) - the end of every fragment is set to the start of the next one.\n"
+            "The last correction can be undone from the Time corrector window."
         )
-        btn_snap_timing.clicked.connect(self._snap_timing)
+        btn_time_corrector.clicked.connect(self._time_corrector)
+        self._time_corrector_undo: Optional[Dict] = None
 
         for btn in [sel_all, sel_none, sel_fail, sel_pending, sel_overlong]:
             btn.setStyleSheet("font-size:11px;padding:2px 8px;")
@@ -320,7 +326,7 @@ class SrtTab(BaseTab):
         filter_row.addWidget(sel_overlong)
         filter_row.addWidget(sel_pending)
         filter_row.addSpacing(8)
-        filter_row.addWidget(btn_snap_timing)
+        filter_row.addWidget(btn_time_corrector)
         lay.addLayout(filter_row)
 
         self._tree = FragmentTreeWidget()
@@ -410,8 +416,8 @@ class SrtTab(BaseTab):
 
     def _load_srt_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self.main, "Open SRT / TXT file", _get_last_dir("srt"),
-            "Subtitle files (*.srt *.txt);;SRT Subtitles (*.srt);;TXT Subtitles (*.txt);;All files (*)",
+            self.main, "Open SRT / ASS / TXT file", _get_last_dir("srt"),
+            "Subtitle files (*.srt *.ass *.ssa *.txt);;SRT Subtitles (*.srt);;ASS Subtitles (*.ass *.ssa);;TXT Subtitles (*.txt);;All files (*)",
         )
         if not path:
             return
@@ -423,7 +429,7 @@ class SrtTab(BaseTab):
             if ext == '.txt':
                 segments = txt_srt_format.load(path)
             else:
-                segments = get_format('.srt').load(path)
+                segments = get_format(ext if ext in supported_extensions() else '.srt').load(path)
             if not segments:
                 QMessageBox.warning(self.main, "Empty file", "No valid subtitle blocks found.")
                 return
@@ -445,6 +451,7 @@ class SrtTab(BaseTab):
             QMessageBox.critical(self.main, "Load error", str(e))
             return
 
+        self.main.undo_manager.clear()
         self._reset_dubbing_state()
 
         self.main._set_status("Detecting language…")
@@ -469,26 +476,21 @@ class SrtTab(BaseTab):
         self._redistribute_split_timings(self._fragments)
 
         self._srt_path = path
-        self._output_dir = str(Path(OUTPUTS_DIR) / Path(path).stem)
+        self._output_dir = str(self._session_dirs(path)[1])
 
-        auto = self._auto_session_path()
-        if auto and auto.exists():
-            reply = QMessageBox.question(
-                self.main, "Restore previous session",
-                f"A saved session was found for this file.\n\n"
-                f"Restore it? Previously synthesized fragments will be loaded automatically.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                try:
-                    with open(str(auto), "r", encoding="utf-8") as fh:
-                        data = json.load(fh)
-                    self._restore_session_data(data)
-                    logger.info(f"Auto-session restored from: {auto}")
-                    return
-                except Exception as e:
-                    logger.warning(f"Auto-session restore failed: {e}")
-                    self.main._set_status("Could not restore previous session — starting fresh.", C["warning"])
+        chosen = choose_session_file(
+            self.main, [self._auto_session_path(), self._user_session_path()]
+        )
+        if chosen:
+            try:
+                with open(str(chosen), "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                self._restore_session_data(data)
+                logger.info(f"Session restored from: {chosen}")
+                return
+            except Exception as e:
+                logger.warning(f"Session restore failed: {e}")
+                self.main._set_status("Could not restore previous session — starting fresh.", C["warning"])
 
         fname = Path(path).name
         self._srt_label.setText(
@@ -522,6 +524,7 @@ class SrtTab(BaseTab):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        self.main.undo_manager.clear()
         self._fragments.clear()
         self._frag_items.clear()
         self._chapter_item = None
@@ -633,6 +636,9 @@ class SrtTab(BaseTab):
 
         self._tree.resizeColumnToContents(COL_TIMING)
 
+        if self._filter_edit is not None:
+            self._apply_filter(self._filter_edit.text())
+
     def _create_tree_item(self, frag: Dict, parent=None) -> QTreeWidgetItem:
         status = frag.get('status', 'waiting')
         icon = {
@@ -646,9 +652,18 @@ class SrtTab(BaseTab):
 
         item = QTreeWidgetItem(parent) if parent is not None else QTreeWidgetItem()
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-        item.setCheckState(COL_STATUS, Qt.CheckState.Checked)
+        item.setCheckState(
+            COL_STATUS,
+            Qt.CheckState.Checked if frag.get('_checked', True) else Qt.CheckState.Unchecked,
+        )
         item.setText(COL_STATUS, "")
-        item.setText(COL_FRAGMENT, f"{icon}  #{num}  {frag.get('text', '')[:75]}")
+
+        base_text = frag.get('text', '')
+        prefix = (frag.get('prefix') or '').strip()
+        suffix = (frag.get('suffix') or '').strip()
+        parts = [x for x in [prefix, base_text, suffix] if x]
+        display = " ".join(parts)
+        item.setText(COL_FRAGMENT, f"{icon}  #{num}  {display}")
         item.setText(COL_SPEAKER, frag.get('speaker') or "")
 
         start_ms = frag.get('start_ms', 0) or 0
@@ -701,7 +716,7 @@ class SrtTab(BaseTab):
         suffix = (frag.get('suffix') or '').strip()
         parts = [x for x in [prefix, base_text, suffix] if x]
         display = " ".join(parts)
-        item.setText(COL_FRAGMENT, f"{icon}  #{num}  {display[:75]}")
+        item.setText(COL_FRAGMENT, f"{icon}  #{num}  {display}")
         item.setText(COL_SPEAKER, frag.get('speaker') or "")
         item.setForeground(COL_FRAGMENT, QColor(C["text"]))
 
@@ -760,31 +775,77 @@ class SrtTab(BaseTab):
             result.append(frag)
         return result
 
+    def _on_item_check_changed(self, item, column):
+        if column != COL_STATUS:
+            return
+        idx = item.data(COL_STATUS, Qt.ItemDataRole.UserRole)
+        if idx is None:
+            return
+        if 0 <= idx < len(self._fragments) and self._fragments[idx].get('index') == idx:
+            frag = self._fragments[idx]
+        else:
+            frag = next((f for f in self._fragments if f['index'] == idx), None)
+        if frag is not None:
+            frag['_checked'] = item.checkState(COL_STATUS) == Qt.CheckState.Checked
+
+    def _sync_checks_from_tree(self):
+        if not self._chapter_item:
+            return
+        frag_map = {f['index']: f for f in self._fragments}
+        for i in range(self._chapter_item.childCount()):
+            child = self._chapter_item.child(i)
+            idx = child.data(COL_STATUS, Qt.ItemDataRole.UserRole)
+            frag = frag_map.get(idx)
+            if frag is not None:
+                frag['_checked'] = child.checkState(COL_STATUS) == Qt.CheckState.Checked
+
     def _apply_filter(self, text: str):
         if not self._chapter_item:
             return
-        txt = text.lower().strip()
-        for i in range(self._chapter_item.childCount()):
-            child = self._chapter_item.child(i)
-            matches = (not txt or
-                       txt in child.text(COL_FRAGMENT).lower() or
-                       txt in child.text(COL_SPEAKER).lower())
-            child.setHidden(not matches)
+        txt = " ".join(text.lower().split())
+        frag_map = {f['index']: f for f in self._fragments}
+        self._tree.setUpdatesEnabled(False)
+        try:
+            for i in range(self._chapter_item.childCount()):
+                child = self._chapter_item.child(i)
+                if not txt:
+                    child.setHidden(False)
+                    continue
+                idx = child.data(COL_STATUS, Qt.ItemDataRole.UserRole)
+                frag = frag_map.get(idx)
+                if frag is None:
+                    child.setHidden(True)
+                    continue
+                haystack = " ".join(
+                    p for p in (
+                        (frag.get('prefix') or '').strip(),
+                        (frag.get('text') or '').strip(),
+                        (frag.get('suffix') or '').strip(),
+                        (frag.get('speaker') or '').strip(),
+                    ) if p
+                ).lower()
+                haystack = " ".join(haystack.split())
+                child.setHidden(txt not in haystack)
+        finally:
+            self._tree.setUpdatesEnabled(True)
 
     def _select_all(self, state: bool):
         if not self._chapter_item:
             return
-        cs = Qt.CheckState.Checked if state else Qt.CheckState.Unchecked
         self._tree.setUpdatesEnabled(False)
         self._tree.blockSignals(True)
         try:
             for i in range(self._chapter_item.childCount()):
                 child = self._chapter_item.child(i)
-                if not child.isHidden():
-                    child.setCheckState(COL_STATUS, cs)
+                checked = state and not child.isHidden()
+                child.setCheckState(
+                    COL_STATUS,
+                    Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked,
+                )
         finally:
             self._tree.blockSignals(False)
             self._tree.setUpdatesEnabled(True)
+        self._sync_checks_from_tree()
 
     def _select_failed(self):
         if not self._chapter_item:
@@ -823,25 +884,26 @@ class SrtTab(BaseTab):
         try:
             for i in range(self._chapter_item.childCount()):
                 child = self._chapter_item.child(i)
-                if child.isHidden():
-                    continue
-                idx = child.data(COL_STATUS, Qt.ItemDataRole.UserRole)
-                frag = frag_map.get(idx)
-                if not frag:
-                    continue
-                status = frag.get('status', 'waiting')
-                if want_failed and want_pending:
-                    match = status in ('error', 'waiting')
-                elif want_failed:
-                    match = status == 'error'
-                elif want_pending:
-                    match = status == 'waiting'
-                else:
-                    match = False
-                child.setCheckState(COL_STATUS, Qt.CheckState.Checked if match else Qt.CheckState.Unchecked)
+                match = False
+                if not child.isHidden():
+                    idx = child.data(COL_STATUS, Qt.ItemDataRole.UserRole)
+                    frag = frag_map.get(idx)
+                    if frag is not None:
+                        status = frag.get('status', 'waiting')
+                        if want_failed and want_pending:
+                            match = status in ('error', 'waiting')
+                        elif want_failed:
+                            match = status == 'error'
+                        elif want_pending:
+                            match = status == 'waiting'
+                child.setCheckState(
+                    COL_STATUS,
+                    Qt.CheckState.Checked if match else Qt.CheckState.Unchecked,
+                )
         finally:
             self._tree.blockSignals(False)
             self._tree.setUpdatesEnabled(True)
+        self._sync_checks_from_tree()
 
     def _on_selection_changed(self):
         items = self._tree.selectedItems()
@@ -855,24 +917,34 @@ class SrtTab(BaseTab):
         frag = next((f for f in self._fragments if f['index'] == idx), None)
         if not frag:
             return
-        self._preview_text.setPlainText(frag.get('text', ''))
-        
+
         start_s = frag.get('start_ms', 0) / 1000.0
         end_s = frag.get('end_ms', 0) / 1000.0
-        
-        if hasattr(self.main, '_video_player') and self.main._video_player.isVisible():
-            overflow_end_s = None
-            if frag.get('status') == 'done':
-                dur = _get_wav_duration(frag.get('output_path', ''))
-                if dur is not None:
-                    slot_s = end_s - start_s
-                    if dur > slot_s:
-                        overflow_end_s = start_s + dur
-            
-            self.main._video_player.set_selection_by_time(start_s, end_s, overflow_end_s)
-            
-        if getattr(self, '_media_player', None) is not None and self._media_player.source().isValid():
-            self._media_player.setPosition(int(start_s * 1000))
+        self._click_pos_ms = int(start_s * 1000)
+
+        was_playing = False
+        if hasattr(self.main, '_video_player'):
+            was_playing = self.main._video_player.is_playing()
+
+        self._suppress_scroll = not was_playing
+        try:
+            if hasattr(self.main, '_video_player') and self.main._video_player.isVisible():
+                overflow_end_s = None
+                if frag.get('status') == 'done':
+                    dur = _get_wav_duration(frag.get('output_path', ''))
+                    if dur is not None:
+                        slot_s = end_s - start_s
+                        if dur > slot_s:
+                            overflow_end_s = start_s + dur
+                self.main._video_player.set_selection_by_time(start_s, end_s, overflow_end_s)
+
+            if getattr(self, '_media_player', None) is not None and self._media_player.source().isValid():
+                self._media_player.setPosition(int(start_s * 1000))
+        finally:
+            self._suppress_scroll = False
+
+        self._preview_text.setPlainText(frag.get('text', ''))
+        self._last_preview_idx = idx
 
     def _on_tree_item_clicked(self, item, column):
         idx = item.data(COL_STATUS, Qt.ItemDataRole.UserRole)
@@ -910,6 +982,49 @@ class SrtTab(BaseTab):
     # Synthesis
     # ------------------------------------------------------------------
 
+    def _get_retry_settings(self) -> Tuple[bool, int, float]:
+        check = getattr(self.main, "_retry_check", None)
+        spin = getattr(self.main, "_retry_spin", None)
+        tol_spin = getattr(self.main, "_retry_tol_spin", None)
+        if check is None or spin is None or not check.isChecked():
+            return False, 0, 0.0
+        tol_s = float(tol_spin.value()) if tol_spin is not None else 0.0
+        return True, int(spin.value()), tol_s
+
+    def _release_audio_file_locks(self):
+        self._dub_hold_until = max(
+            getattr(self, '_dub_hold_until', 0.0), time.monotonic() + 2.0
+        )
+        players = []
+        dub = getattr(self, '_dub_player', None)
+        if dub is not None:
+            players.append(dub)
+        for pair in (getattr(self, '_extra_dub_players', None) or {}).values():
+            players.append(pair[0])
+        for player in players:
+            try:
+                player.stop()
+                player.setSource(QUrl())
+            except Exception as e:
+                logger.warning(f"Could not release dub player: {e}")
+        self._current_sim_frag_idx = None
+        self._last_sim_pos_ms = None
+        self._dub_schedule = []
+        self._dub_schedule_sig = None
+        extra_state = getattr(self, '_extra_sim_idx', None)
+        if extra_state:
+            extra_state.clear()
+        for attempt in range(30):
+            QApplication.processEvents()
+            time.sleep(0.03)
+            if attempt >= 4 and all(
+                p.mediaStatus() == QMediaPlayer.MediaStatus.NoMedia for p in players
+            ):
+                break
+
+    def _dub_sync_held(self) -> bool:
+        return time.monotonic() < getattr(self, '_dub_hold_until', 0.0)
+
     def _start_synthesis(self, retry_errors: bool = False):
         if not self.main._model_is_loaded:
             QMessageBox.warning(self.main, "Model not loaded", "Load the model first.")
@@ -943,6 +1058,8 @@ class SrtTab(BaseTab):
             frag["error_msg"] = None
             self._update_tree_item(frag["index"])
 
+        self._release_audio_file_locks()
+
         self._synthesis_source = 'srt'
         self._is_running = True
         self._completed_count = 0
@@ -958,6 +1075,7 @@ class SrtTab(BaseTab):
         self._eta_label.setVisible(True)
 
         reserved_paths = {f['output_path'] for f in self._fragments if f.get('output_path')}
+        retry_enabled, retry_max, retry_tol = self._get_retry_settings()
 
         self._worker = TTSWorker(
             backend=self.main._backend,
@@ -970,6 +1088,9 @@ class SrtTab(BaseTab):
             normalize_audio=self._norm_check.isChecked(),
             speaker_voices=self._get_speaker_voices_dict(),
             reserved_paths=reserved_paths,
+            retry_until_fit=retry_enabled,
+            max_retries=retry_max,
+            retry_tolerance_s=retry_tol,
         )
 
         self._worker.progress.connect(self._on_progress)
@@ -1082,6 +1203,8 @@ class SrtTab(BaseTab):
         frag["error_msg"] = None
         self._update_tree_item(frag["index"])
 
+        self._release_audio_file_locks()
+
         self._is_running = True
         self._completed_count = 0
         self._synth_start_time = time.monotonic()
@@ -1096,6 +1219,7 @@ class SrtTab(BaseTab):
         reserved_paths = {
             f['output_path'] for f in self._fragments if f.get('output_path')
         }
+        retry_enabled, retry_max, retry_tol = self._get_retry_settings()
 
         self._worker = TTSWorker(
             backend=self.main._backend,
@@ -1108,6 +1232,9 @@ class SrtTab(BaseTab):
             normalize_audio=self._norm_check.isChecked(),
             speaker_voices=self._get_speaker_voices_dict(),
             reserved_paths=reserved_paths,
+            retry_until_fit=retry_enabled,
+            max_retries=retry_max,
+            retry_tolerance_s=retry_tol,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.item_done.connect(self._on_item_done)
@@ -1211,6 +1338,37 @@ class SrtTab(BaseTab):
 
         menu.exec(self._tree.viewport().mapToGlobal(pos))
 
+    def _undo_begin(self, with_files: bool = False) -> Optional[Dict]:
+        try:
+            return snapshot_fragments(self._fragments, with_files)
+        except Exception as e:
+            logger.warning(f"Undo snapshot failed: {e}")
+            self.main.undo_manager.clear()
+            return None
+
+    def _undo_commit(self, label: str, before: Optional[Dict]):
+        if before is not None:
+            self.main.undo_manager.push('srt', label, before)
+
+    def _undo_capture(self, with_files: bool = False) -> Dict:
+        return snapshot_fragments(self._fragments, with_files)
+
+    def _undo_restore(self, state: Dict) -> int:
+        missing = restore_snapshot_files(state, self._fragments, self._file_watcher)
+        missing_set = set(missing)
+        fragments = copy.deepcopy(state['fragments'])
+        for f in fragments:
+            if f.get('output_path') in missing_set:
+                f['status'] = 'waiting'
+                f['output_path'] = None
+        self._fragments = fragments
+        if state.get('files') is not None:
+            self._tc_reset_current_fragment()
+        self._populate_tree()
+        self._sync_speaker_ui_from_fragments()
+        self.main._update_action_buttons()
+        return len(missing)
+
     def _edit_fragment_text(self, frag: Dict):
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Edit fragment #{frag['index'] + 1}")
@@ -1246,11 +1404,13 @@ class SrtTab(BaseTab):
         if not new_text or new_text == frag.get('text', ''):
             return
 
+        before = self._undo_begin()
         frag['text'] = new_text
         frag['status'] = 'waiting'
         frag['error_msg'] = None
         self._update_tree_item(frag['index'])
         self._preview_text.setPlainText(new_text)
+        self._undo_commit(f"text edit of fragment #{frag['index'] + 1}", before)
         self.main._set_status(f"Fragment #{frag['index'] + 1} text updated — status reset to waiting.")
 
     def _edit_fragment_time(self, frag: Dict):
@@ -1327,11 +1487,13 @@ class SrtTab(BaseTab):
             QMessageBox.warning(self.main, "Invalid time", "Start time must be less than end time.")
             return
 
+        before = self._undo_begin()
         frag['start_ms'] = new_start_ms
         frag['end_ms'] = new_end_ms
         frag['srt_end_ms'] = new_end_ms
         frag['timestamp'] = f"{_ms_to_ts(new_start_ms)} --> {_ms_to_ts(new_end_ms)}"
         self._update_tree_item(frag['index'])
+        self._undo_commit(f"time edit of fragment #{frag['index'] + 1}", before)
         self.main._set_status(
             f"Fragment #{frag['index'] + 1} time updated: "
             f"{_ms_to_ts(new_start_ms)} → {_ms_to_ts(new_end_ms)}", C["accent"]
@@ -1373,6 +1535,8 @@ class SrtTab(BaseTab):
         if pos < 0:
             return
 
+        before = self._undo_begin(True)
+
         end_ms = frag.get('end_ms', 0) or 0
         new_frag = {
             'index': 0,
@@ -1396,6 +1560,7 @@ class SrtTab(BaseTab):
         self._rename_outputs_to_match_order()
         self._populate_tree()
         self.main._update_action_buttons()
+        self._undo_commit("adding a fragment", before)
 
         new_item = self._frag_items.get(pos + 1)
         if new_item:
@@ -1453,6 +1618,8 @@ class SrtTab(BaseTab):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
+        before = self._undo_begin(True)
+
         if result["action"] == "all":
             removed_fragments = [f for f in self._fragments if f['index'] in checked_indices]
             self._fragments = [f for f in self._fragments if f['index'] not in checked_indices]
@@ -1460,14 +1627,31 @@ class SrtTab(BaseTab):
             removed_fragments = [f for f in self._fragments if f['index'] == frag['index']]
             self._fragments = [f for f in self._fragments if f['index'] != frag['index']]
 
+        self._release_audio_file_locks()
+        try:
+            self.main._stop_play()
+        except Exception:
+            pass
+        QApplication.processEvents()
+
         for f in removed_fragments:
             p = f.get('output_path', '')
-            if p and os.path.exists(p):
+            if not p or not os.path.exists(p):
+                continue
+            try:
                 self._file_watcher.removePath(p)
-                try:
-                    os.remove(p)
-                except Exception as e:
-                    logger.warning(f"Could not delete orphan audio {p}: {e}")
+            except Exception:
+                pass
+            try:
+                dst = move_to_trash(p)
+                logger.info(f"Moved removed audio to trash: {dst}")
+            except Exception as e:
+                logger.error(f"Cannot move {p} to trash: {e}")
+                self.main._set_status(
+                    f"Could not move file to trash: {Path(p).name} "
+                    f"(close any player or Explorer window and retry)",
+                    C["warning"],
+                )
 
         for i, f in enumerate(self._fragments):
             f['index'] = i
@@ -1476,6 +1660,7 @@ class SrtTab(BaseTab):
         self._rename_outputs_to_match_order()
         self._populate_tree()
         self.main._update_action_buttons()
+        self._undo_commit(f"removal of {len(removed_fragments)} fragment(s)", before)
         self.main._set_status(f"Fragment(s) removed. {len(self._fragments)} fragments remaining.")
 
     def _move_fragment(self, frag: Dict, direction: int):
@@ -1486,6 +1671,9 @@ class SrtTab(BaseTab):
         if new_pos < 0 or new_pos >= len(self._fragments):
             return
 
+        label = f"moving fragment #{frag['index'] + 1} {'down' if direction > 0 else 'up'}"
+        before = self._undo_begin(True)
+
         self._fragments[pos], self._fragments[new_pos] = self._fragments[new_pos], self._fragments[pos]
 
         for i, f in enumerate(self._fragments):
@@ -1494,6 +1682,7 @@ class SrtTab(BaseTab):
 
         self._rename_outputs_to_match_order()
         self._populate_tree()
+        self._undo_commit(label, before)
 
         moved_item = self._frag_items.get(new_pos)
         if moved_item:
@@ -1502,57 +1691,234 @@ class SrtTab(BaseTab):
     def _rename_outputs_to_match_order(self):
         if not self._srt_path or not self._output_dir:
             return
-        prefix = Path(self._srt_path).stem
 
-        to_rename = [
-            frag for frag in self._fragments
-            if frag.get('output_path') and os.path.exists(frag['output_path'])
-        ]
-        if not to_rename:
-            return
+        self._release_audio_file_locks()
+        self._dub_hold_until = float('inf')
+        try:
+            prefix = Path(self._srt_path).stem
 
-        desired = {
-            frag['index']: os.path.join(
-                self._output_dir, f"{prefix}_{frag['index'] + 1:03d}.wav"
-            )
-            for frag in to_rename
-        }
+            def _norm(p: str) -> str:
+                return os.path.normcase(os.path.abspath(p))
 
-        if all(frag['output_path'] == desired[frag['index']] for frag in to_rename):
-            return
+            to_rename: List[Dict] = []
+            seen_paths: Set[str] = set()
+            for frag in self._fragments:
+                p = frag.get('output_path')
+                if not p or not os.path.exists(p):
+                    continue
+                key = _norm(p)
+                if key in seen_paths:
+                    continue
+                seen_paths.add(key)
+                to_rename.append(frag)
+            if not to_rename:
+                return
 
-        for frag in to_rename:
-            self._file_watcher.removePath(frag['output_path'])
+            desired = {
+                frag['index']: os.path.join(
+                    self._output_dir, f"{prefix}_{frag['index'] + 1:03d}.wav"
+                )
+                for frag in to_rename
+            }
 
-        temp_map = {}
-        for frag in to_rename:
-            src = frag['output_path']
-            tmp = src + '.__reorder__'
-            try:
-                os.rename(src, tmp)
-                temp_map[frag['index']] = tmp
-            except Exception as e:
-                logger.warning(f"Reorder phase 1 failed for {src}: {e}")
-                temp_map[frag['index']] = src
+            if all(
+                _norm(frag['output_path']) == _norm(desired[frag['index']])
+                for frag in to_rename
+            ):
+                return
 
-        for frag in to_rename:
-            tmp = temp_map[frag['index']]
-            dst = desired[frag['index']]
-            if tmp == frag['output_path']:
-                continue
-            try:
-                os.rename(tmp, dst)
-                frag['output_path'] = dst
-            except Exception as e:
-                logger.warning(f"Reorder phase 2 failed {tmp} -> {dst}: {e}")
+            for frag in to_rename:
                 try:
-                    os.rename(tmp, frag['output_path'])
+                    self._file_watcher.removePath(frag['output_path'])
                 except Exception:
                     pass
 
-        for frag in to_rename:
-            if frag.get('output_path') and os.path.exists(frag['output_path']):
-                self._file_watcher.addPath(frag['output_path'])
+            def _safe_rename(src: str, dst: str, retries: int = 15, delay: float = 0.1) -> Tuple[bool, Optional[Exception]]:
+                last_exc: Optional[Exception] = None
+                for attempt in range(retries):
+                    if os.path.exists(dst):
+                        return False, FileExistsError(dst)
+                    try:
+                        os.rename(src, dst)
+                        return True, None
+                    except FileNotFoundError as e:
+                        return False, e
+                    except OSError as e:
+                        last_exc = e
+                        if attempt < retries - 1:
+                            QApplication.processEvents()
+                            time.sleep(delay)
+                return False, last_exc
+
+            owned: Set[str] = {
+                _norm(f['output_path']) for f in self._fragments if f.get('output_path')
+            }
+
+            def _temp_path(src: str) -> str:
+                if '.__reorder__' in os.path.basename(src):
+                    return src
+                root, ext = os.path.splitext(src)
+                candidate = f"{root}.__reorder__{ext}"
+                n = 1
+                while os.path.exists(candidate) or _norm(candidate) in owned:
+                    candidate = f"{root}.__reorder__{n}{ext}"
+                    n += 1
+                return candidate
+
+            def _owner_of(path: str, exclude_index: int) -> Optional[Dict]:
+                key = _norm(path)
+                for other in self._fragments:
+                    other_path = other.get('output_path')
+                    if other['index'] == exclude_index or not other_path:
+                        continue
+                    if _norm(other_path) == key:
+                        return other
+                return None
+
+            for frag in to_rename:
+                src = frag['output_path']
+                tmp = _temp_path(src)
+                if tmp == src:
+                    continue
+                ok, err = _safe_rename(src, tmp)
+                if ok:
+                    frag['output_path'] = tmp
+                    owned.add(_norm(tmp))
+                else:
+                    logger.warning(f"Reorder phase 1 failed for {src}: {err}")
+
+            backup_dir = os.path.join(self._output_dir, "__undo_backup")
+            ts = int(time.time() * 1000)
+            failed_count = 0
+            pending = list(to_rename)
+
+            while pending:
+                progress = False
+                next_pending: List[Dict] = []
+                for frag in pending:
+                    idx = frag['index']
+                    cur = frag['output_path']
+                    dst = desired[idx]
+
+                    if _norm(cur) == _norm(dst):
+                        frag['output_path'] = dst
+                        progress = True
+                        continue
+
+                    if os.path.exists(dst):
+                        if _owner_of(dst, idx) is not None:
+                            next_pending.append(frag)
+                            continue
+                        cleared = False
+                        try:
+                            os.remove(dst)
+                            cleared = True
+                            logger.info(f"Removed orphan reorder target: {dst}")
+                        except Exception as rm_err:
+                            logger.warning(f"Cannot remove orphan target {dst}: {rm_err}")
+                        if not cleared:
+                            try:
+                                os.makedirs(backup_dir, exist_ok=True)
+                                bdst = os.path.join(backup_dir, f"{ts}_{os.path.basename(dst)}")
+                                shutil.move(dst, bdst)
+                                cleared = True
+                                logger.info(f"Moved orphan target to backup: {bdst}")
+                            except Exception as mv_err:
+                                logger.error(f"Cannot move orphan target {dst}: {mv_err}")
+                        if not cleared:
+                            failed_count += 1
+                            continue
+
+                    ok, err = _safe_rename(cur, dst)
+                    if ok:
+                        frag['output_path'] = dst
+                        progress = True
+                    else:
+                        failed_count += 1
+                        logger.warning(
+                            f"Reorder phase 2 failed {cur} -> {dst}: {err}; "
+                            f"file kept at {cur}"
+                        )
+
+                if not next_pending:
+                    break
+                if not progress:
+                    failed_count += len(next_pending)
+                    for frag in next_pending:
+                        logger.warning(
+                            f"Reorder blocked for fragment {frag['index']}: "
+                            f"target occupied, file kept at {frag['output_path']}"
+                        )
+                    break
+                pending = next_pending
+
+            for frag in self._fragments:
+                p = frag.get('output_path')
+                if p and os.path.exists(p):
+                    try:
+                        self._file_watcher.addPath(p)
+                    except Exception:
+                        pass
+
+            if failed_count:
+                logger.warning(f"Reorder completed with {failed_count} file(s) not renamed")
+                self.main._set_status(
+                    f"{failed_count} audio file(s) could not be renamed and were kept "
+                    f"under temporary names; they will be fixed on the next reorder.",
+                    C["warning"],
+                )
+        finally:
+            self._dub_hold_until = 0.0
+            self._sanitize_fragment_outputs()
+
+    def _sanitize_fragment_outputs(self) -> int:
+        prefix = Path(self._srt_path).stem if self._srt_path else ""
+
+        def _norm(p: str) -> str:
+            return os.path.normcase(os.path.abspath(p))
+
+        def _expected(frag: Dict) -> str:
+            return f"{prefix}_{frag['index'] + 1:03d}.wav"
+
+        ordered = sorted(
+            self._fragments,
+            key=lambda f: 0 if os.path.basename(f.get('output_path') or "") == _expected(f) else 1,
+        )
+
+        claimed: Set[str] = set()
+        reset_count = 0
+        for frag in ordered:
+            if frag.get('status') != 'done':
+                continue
+            path = frag.get('output_path')
+            valid = False
+            if path:
+                try:
+                    valid = os.path.isfile(path) and os.path.getsize(path) > 0
+                except OSError:
+                    valid = False
+            if valid:
+                key = _norm(path)
+                if key in claimed:
+                    valid = False
+                else:
+                    claimed.add(key)
+            if not valid:
+                logger.warning(
+                    f"Fragment {frag['index'] + 1} marked done but audio is missing, "
+                    f"empty or shared: {path}; reset to waiting"
+                )
+                frag['status'] = 'waiting'
+                frag['output_path'] = None
+                frag['error_msg'] = None
+                reset_count += 1
+
+        if reset_count:
+            self.main._set_status(
+                f"{reset_count} fragment(s) had missing or invalid audio and were reset to waiting.",
+                C["warning"],
+            )
+        return reset_count
 
     # ------------------------------------------------------------------
     # Merge
@@ -1723,25 +2089,47 @@ class SrtTab(BaseTab):
                 return
             self._do_merge_gap_groups(groups)
 
-    def _do_merge_srt_fragments(self, fragments: List[Dict]):
+    def _do_merge_srt_fragments(
+        self,
+        fragments: List[Dict],
+        text_override: Optional[str] = None,
+        end_ms_override: Optional[int] = None,
+        drop_audio: bool = False,
+        refresh: bool = True,
+    ):
         if len(fragments) < 2:
             return
 
+        self._release_audio_file_locks()
+        QApplication.processEvents()
+
+        before = self._undo_begin(True) if refresh else None
+
         self.main._stop_play()
 
-        combined_text = " ".join(
-            f.get('text', '').strip() for f in fragments if f.get('text', '').strip()
-        )
+        if text_override is not None:
+            combined_text = text_override
+        else:
+            combined_text = " ".join(
+                f.get('text', '').strip() for f in fragments if f.get('text', '').strip()
+            )
         start_ms = fragments[0].get('start_ms', 0) or 0
-        end_ms = fragments[-1].get('end_ms', 0) or 0
-        srt_end = fragments[-1].get('srt_end_ms', end_ms) or end_ms
+        if end_ms_override is not None:
+            end_ms = end_ms_override
+            srt_end = max(
+                (f.get('srt_end_ms', f.get('end_ms', 0)) or 0) for f in fragments
+            )
+        else:
+            end_ms = fragments[-1].get('end_ms', 0) or 0
+            srt_end = fragments[-1].get('srt_end_ms', end_ms) or end_ms
         speaker = fragments[0].get('speaker', '')
 
         target_sr = 44100
         parts: List[np.ndarray] = []
+        loaded_count = 0
         import torch
         import torchaudio.functional as TAF
-        for df in fragments:
+        for df in ([] if drop_audio else fragments):
             ap = df.get('output_path', '')
             if df.get('status') == 'done' and ap and os.path.exists(ap):
                 try:
@@ -1753,17 +2141,21 @@ class SrtTab(BaseTab):
                         t = TAF.resample(t, sr, target_sr)
                         audio = t.squeeze(0).numpy()
                     parts.append(audio.astype(np.float32))
+                    loaded_count += 1
                 except Exception as e:
                     logger.warning(f"Merge: cannot load {ap}: {e}")
 
         merged_audio_path: Optional[str] = None
         merged_status = 'waiting'
 
-        if parts:
+        if parts and loaded_count == len(fragments):
             try:
                 os.makedirs(self._output_dir, exist_ok=True)
-                tmp_name = f"__merge_tmp_{abs(hash(tuple(f['index'] for f in fragments))) % 10**9}.wav"
-                tmp_path = os.path.join(self._output_dir, tmp_name)
+                stamp = time.time_ns()
+                tmp_path = os.path.join(self._output_dir, f"__merge_tmp_{stamp}.wav")
+                while os.path.exists(tmp_path):
+                    stamp += 1
+                    tmp_path = os.path.join(self._output_dir, f"__merge_tmp_{stamp}.wav")
                 combined = np.concatenate(parts)
                 sf.write(tmp_path, combined, target_sr, subtype='PCM_16')
                 merged_audio_path = tmp_path
@@ -1804,12 +2196,21 @@ class SrtTab(BaseTab):
             f['index'] = i
             f['srt_id'] = str(i + 1)
 
+        kept_paths = {
+            os.path.normcase(os.path.abspath(f['output_path']))
+            for f in self._fragments if f.get('output_path')
+        }
         for p in paths_to_delete:
+            if os.path.normcase(os.path.abspath(p)) in kept_paths:
+                continue
             try:
                 if os.path.exists(p):
                     os.remove(p)
             except Exception as e:
                 logger.warning(f"Could not delete orphan audio {p}: {e}")
+
+        if not refresh:
+            return
 
         self._rename_outputs_to_match_order()
 
@@ -1824,15 +2225,22 @@ class SrtTab(BaseTab):
 
         self._populate_tree()
         self.main._update_action_buttons()
+        self._undo_commit(f"merge of {len(fragments)} fragments", before)
         self.main._set_status(
             f"Merged {len(fragments)} fragments into one  "
-            f"({_ms_to_ts(start_ms)} → {_ms_to_ts(end_ms)}).",
+            f"({_ms_to_ts(start_ms)} → {_ms_to_ts(end_ms)})."
+            + ("" if merged_status == 'done' else "  Re-synthesis required."),
             C["accent"],
         )
 
     def _do_merge_gap_groups(self, groups: List[List[Dict]]):
         if not groups:
             return
+
+        self._release_audio_file_locks()
+        QApplication.processEvents()
+
+        before = self._undo_begin(True)
 
         self.main._stop_play()
 
@@ -1855,6 +2263,7 @@ class SrtTab(BaseTab):
             speaker = group[0].get('speaker', '')
 
             parts: List[np.ndarray] = []
+            loaded_count = 0
             for df in group:
                 ap = df.get('output_path', '')
                 if df.get('status') == 'done' and ap and os.path.exists(ap):
@@ -1867,16 +2276,20 @@ class SrtTab(BaseTab):
                             t = TAF.resample(t, sr, target_sr)
                             audio = t.squeeze(0).numpy()
                         parts.append(audio.astype(np.float32))
+                        loaded_count += 1
                     except Exception as e:
                         logger.warning(f"Gap merge: cannot load {ap}: {e}")
 
             merged_audio_path: Optional[str] = None
             merged_status = 'waiting'
-            if parts:
+            if parts and loaded_count == len(group):
                 try:
                     os.makedirs(self._output_dir, exist_ok=True)
-                    tmp_name = f"__merge_tmp_{abs(hash(tuple(f['index'] for f in group))) % 10**9}.wav"
-                    tmp_path = os.path.join(self._output_dir, tmp_name)
+                    stamp = time.time_ns()
+                    tmp_path = os.path.join(self._output_dir, f"__merge_tmp_{stamp}.wav")
+                    while os.path.exists(tmp_path):
+                        stamp += 1
+                        tmp_path = os.path.join(self._output_dir, f"__merge_tmp_{stamp}.wav")
                     sf.write(tmp_path, np.concatenate(parts), target_sr, subtype='PCM_16')
                     merged_audio_path = tmp_path
                     merged_status = 'done'
@@ -1905,6 +2318,12 @@ class SrtTab(BaseTab):
 
         leader_map: Dict[int, Dict] = {p['leader_idx']: p for p in prepared}
 
+        kept_paths = {
+            os.path.normcase(os.path.abspath(f['output_path']))
+            for f in self._fragments
+            if f['index'] not in all_group_indices and f.get('output_path')
+        }
+
         for f in self._fragments:
             if f['index'] in all_group_indices:
                 p = f.get('output_path', '')
@@ -1918,7 +2337,11 @@ class SrtTab(BaseTab):
                 if orig_idx in leader_map:
                     new_fragments.append(leader_map[orig_idx]['frag'])
                 p = f.get('output_path', '')
-                if p and os.path.exists(p):
+                if (
+                    p
+                    and os.path.exists(p)
+                    and os.path.normcase(os.path.abspath(p)) not in kept_paths
+                ):
                     try:
                         os.remove(p)
                     except Exception as e:
@@ -1948,127 +2371,713 @@ class SrtTab(BaseTab):
         self._rename_outputs_to_match_order()
         self._populate_tree()
         self.main._update_action_buttons()
-        self.main._set_status(
-            f"Merged {len(all_group_indices)} fragments into {len(prepared)} groups by gap.",
-            C["accent"],
-        )
+        self._undo_commit(f"merge by gap into {len(prepared)} group(s)", before)
+        partial = sum(1 for p in prepared if p['frag'].get('status') != 'done')
+        msg = f"Merged {len(all_group_indices)} fragments into {len(prepared)} groups by gap."
+        if partial:
+            msg += f"  {partial} group(s) require re-synthesis."
+        self.main._set_status(msg, C["accent"])
 
     # ------------------------------------------------------------------
     # Timing Tools
     # ------------------------------------------------------------------
 
-    def _snap_timing(self):
+    @staticmethod
+    def _tc_join_text(left: str, right: str) -> str:
+        left = (left or "").strip()
+        right = (right or "").strip()
+        if not left:
+            return right
+        if not right:
+            return left
+        if not left[-1].isalnum():
+            return f"{left} {right}"
+        if right[0].isupper():
+            return f"{left}. {right}"
+        return f"{left} {right}"
+
+    @staticmethod
+    def _tc_speaker(frag: Dict) -> str:
+        return str(frag.get('speaker') or "").strip()
+
+    def _tc_find_overlaps(self) -> List[Dict]:
+        result: List[Dict] = []
+        for i in range(len(self._fragments) - 1):
+            cur = self._fragments[i]
+            nxt = self._fragments[i + 1]
+            cur_end = cur.get('end_ms', 0) or 0
+            nxt_start = nxt.get('start_ms', 0) or 0
+            overlap = cur_end - nxt_start
+            if overlap <= 0:
+                continue
+            result.append({
+                'cur': cur,
+                'nxt': nxt,
+                'overlap_ms': overlap,
+                'same_speaker': self._tc_speaker(cur) == self._tc_speaker(nxt),
+            })
+        return result
+
+    def _tc_reset_current_fragment(self) -> None:
+        self.main._current_fragment_idx = None
+        self.main._audio_data = None
+        if hasattr(self.main, '_wave_out'):
+            self.main._wave_out.clear()
+        self.main._play_btn.setEnabled(False)
+        self.main._stop_btn.setEnabled(False)
+        self.main._time_lbl.setText("0:00 / 0:00")
+
+    def _tc_refresh_undo_button(self) -> None:
+        btn = getattr(self, '_tc_undo_btn', None)
+        if btn is not None:
+            btn.setEnabled(getattr(self, '_time_corrector_undo', None) is not None)
+
+    @staticmethod
+    def _tc_char_count(frag: Dict) -> int:
+        parts = [
+            (frag.get('prefix') or '').strip(),
+            (frag.get('text') or '').strip(),
+            (frag.get('suffix') or '').strip(),
+        ]
+        return len(" ".join(p for p in parts if p))
+
+    def _tc_speech_rate(self) -> float:
+        total_chars = 0
+        total_dur = 0.0
+        for frag in self._fragments:
+            path = frag.get('output_path')
+            if frag.get('status') != 'done' or not path:
+                continue
+            chars = self._tc_char_count(frag)
+            dur = _get_wav_duration(path)
+            if chars <= 0 or not dur or dur <= 0:
+                continue
+            total_chars += chars
+            total_dur += dur
+        if total_dur <= 0:
+            return 14.0
+        return min(40.0, max(5.0, total_chars / total_dur))
+
+    def _tc_fragment_duration(
+        self,
+        frag: Dict,
+        rate: float,
+        cache: Dict[int, Tuple[Optional[float], bool]],
+    ) -> Tuple[Optional[float], bool]:
+        key = id(frag)
+        if key in cache:
+            return cache[key]
+        result: Tuple[Optional[float], bool] = (None, True)
+        path = frag.get('output_path')
+        if frag.get('status') == 'done' and path:
+            dur = _get_wav_duration(path)
+            if dur is not None:
+                result = (dur, False)
+        if result[0] is None:
+            chars = self._tc_char_count(frag)
+            if chars > 0 and rate > 0:
+                result = (chars / rate, True)
+        cache[key] = result
+        return result
+
+    def _tc_compute_fit(
+        self,
+        cur: Dict,
+        nxt: Dict,
+        action: str,
+        allow_overlap: bool,
+        cache: Dict[int, Tuple[Optional[float], bool]],
+        rate: float,
+    ) -> Tuple[Optional[int], str, str, Optional[float]]:
+        def severity(dur_s: float, slot_s: float) -> int:
+            if dur_s <= slot_s:
+                return 0
+            if dur_s < 2 * slot_s:
+                return 1
+            if dur_s < 4 * slot_s:
+                return 2
+            return 3
+
+        cur_start = cur.get('start_ms', 0) or 0
+        cur_end = cur.get('end_ms', 0) or 0
+        nxt_start = nxt.get('start_ms', 0) or 0
+        nxt_end = nxt.get('end_ms', 0) or 0
+
+        cur_dur, cur_est = self._tc_fragment_duration(cur, rate, cache)
+        nxt_dur, nxt_est = self._tc_fragment_duration(nxt, rate, cache)
+
+        def dur_label(dur: float, est: bool) -> str:
+            return f"{'~' if est else ''}{dur:.1f}s"
+
+        estimate_note = f"\n~ = estimated from text length ({rate:.1f} chars/s)"
+
+        if action == 'merge':
+            if cur_dur is None or nxt_dur is None:
+                return None, "-", "Merge: cannot calculate, a fragment has no text or audio.", None
+            total_dur = cur_dur + nxt_dur
+            slot_s = max(0.001, (max(cur_end, nxt_end) - cur_start) / 1000.0)
+            sev = severity(total_dur, slot_s)
+            diff = total_dur - slot_s
+            estimated = cur_est or nxt_est
+            mark = "~" if estimated else ""
+            text = f"{mark}OK" if sev == 0 else f"{mark}+{diff:.1f}s"
+            tip = (
+                f"Merge fragments:\n"
+                f"  Combined speech: {mark}{total_dur:.1f}s\n"
+                f"  Available slot: {slot_s:.1f}s\n"
+                f"  Result: {'fits' if sev == 0 else f'over by {diff:.1f}s'}"
+            )
+            if estimated:
+                tip += estimate_note
+            return sev, text, tip, diff
+
+        if allow_overlap or nxt_start <= cur_start:
+            cur_slot_s = max(0.001, (cur_end - cur_start) / 1000.0)
+        else:
+            cur_slot_s = max(0.001, (nxt_start - cur_start) / 1000.0)
+        nxt_slot_s = max(0.001, (nxt_end - nxt_start) / 1000.0)
+
+        entries = []
+        for dur, est, slot in (
+            (cur_dur, cur_est, cur_slot_s),
+            (nxt_dur, nxt_est, nxt_slot_s),
+        ):
+            if dur is None:
+                continue
+            entries.append((severity(dur, slot), dur - slot, est))
+
+        if not entries:
+            return None, "-", "Keep separate: cannot calculate, fragments have no text or audio.", None
+
+        sev, diff, _est = max(entries, key=lambda e: (e[0], e[1]))
+        estimated = any(e[2] for e in entries)
+        mark = "~" if estimated else ""
+        text = f"{mark}OK" if sev == 0 else f"{mark}+{diff:.1f}s"
+
+        mode_label = "overlap allowed" if allow_overlap else "no overlap"
+        cur_str = (
+            f"{dur_label(cur_dur, cur_est)} / slot {cur_slot_s:.1f}s"
+            if cur_dur is not None else "no data"
+        )
+        nxt_str = (
+            f"{dur_label(nxt_dur, nxt_est)} / slot {nxt_slot_s:.1f}s"
+            if nxt_dur is not None else "no data"
+        )
+        tip = (
+            f"Keep separate ({mode_label}):\n"
+            f"  #{cur['index'] + 1}: {cur_str}\n"
+            f"  #{nxt['index'] + 1}: {nxt_str}"
+        )
+        if estimated:
+            tip += estimate_note
+        return sev, text, tip, diff
+
+    @staticmethod
+    def _tc_text_suggests_merge(cur: Dict, nxt: Dict) -> bool:
+        cur_text = (cur.get('text') or '').strip()
+        nxt_text = (nxt.get('text') or '').strip()
+        if not cur_text or not nxt_text:
+            return False
+
+        if nxt_text.startswith(('\u2026', '...')):
+            return True
+
+        cur_last = cur_text[-1]
+        nxt_first = nxt_text[0]
+        nxt_last = nxt_text[-1]
+
+        if cur_text.endswith(('...', '\u2026', ',')) and nxt_first.islower():
+            return True
+
+        if cur_last not in '.!?' and nxt_first.islower() and nxt_last in '.!?':
+            return True
+
+        return False
+
+    def _tc_suggest_action(
+        self,
+        cur: Dict,
+        nxt: Dict,
+        allow_overlap: bool,
+        cache: Dict[int, Tuple[Optional[float], bool]],
+        rate: float,
+    ) -> str:
+        if self._tc_text_suggests_merge(cur, nxt):
+            return 'merge'
+
+        keep_sev, _kt, _ktip, keep_diff = self._tc_compute_fit(
+            cur, nxt, 'keep', allow_overlap, cache, rate
+        )
+        merge_sev, _mt, _mtip, merge_diff = self._tc_compute_fit(
+            cur, nxt, 'merge', allow_overlap, cache, rate
+        )
+        if keep_sev is None or merge_sev is None:
+            return 'keep'
+        if keep_sev == 0:
+            return 'keep'
+        if merge_sev < keep_sev:
+            return 'merge'
+        if merge_sev == keep_sev and merge_diff < keep_diff - 0.05:
+            return 'merge'
+        return 'keep'
+
+    def _time_corrector(self):
         if len(self._fragments) < 2:
+            self.main._set_status("Time corrector: at least 2 fragments are required.")
+            return
+        if self._is_running:
+            self.main._set_status("Time corrector: stop synthesis first.")
             return
 
-        checked_indices: set = set()
-        if self._chapter_item:
-            for i in range(self._chapter_item.childCount()):
-                child = self._chapter_item.child(i)
-                if (child.checkState(COL_STATUS) == Qt.CheckState.Checked
-                        and not child.isHidden()):
-                    idx = child.data(COL_STATUS, Qt.ItemDataRole.UserRole)
-                    if idx is not None:
-                        checked_indices.add(idx)
-
-        checked_count = len(checked_indices)
+        overlaps = self._tc_find_overlaps()
+        gap_count = 0
+        trim_count = 0
+        for i in range(len(self._fragments) - 1):
+            cur_start = self._fragments[i].get('start_ms', 0) or 0
+            cur_end = self._fragments[i].get('end_ms', 0) or 0
+            nxt_start = self._fragments[i + 1].get('start_ms', 0) or 0
+            if nxt_start <= cur_start:
+                continue
+            if nxt_start > cur_end:
+                gap_count += 1
+            elif nxt_start < cur_end:
+                trim_count += 1
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("Snap end times — confirm")
-        dlg.resize(480, 0)
+        dlg.setWindowTitle("Time corrector")
+        dlg.resize(960, 700)
         dlg.setStyleSheet(self.main.styleSheet())
-
         lay = QVBoxLayout(dlg)
-        lay.setSpacing(12)
+        lay.setSpacing(8)
         lay.setContentsMargins(16, 16, 16, 12)
 
-        title_lbl = QLabel("⚠️  Snap end times to next fragment's start")
-        title_lbl.setStyleSheet(f"color:{C['warning']};font-size:13px;font-weight:bold;")
-        lay.addWidget(title_lbl)
+        def _section(title: str):
+            lbl = QLabel(title)
+            lbl.setStyleSheet(f"color:{C['accent']};font-size:12px;font-weight:bold;")
+            lay.addSpacing(4)
+            lay.addWidget(lbl)
 
-        desc = QLabel(
-            "This operation will overwrite the end time of each fragment "
-            "to match the start time of the next fragment, removing all gaps.\n\n"
-            "Recommended workflow before using Snap:\n"
-            "  1. Merge all fragments that belong together into single entries.\n"
-            "  2. Verify timing in the tree — yellow/orange/red indicators "
-            "signal fragments whose synthesized audio already exceeds the slot.\n"
-            "  3. Only then run Snap to close the remaining gaps.\n\n"
-            "Running Snap before merging may cause closely spaced fragments to "
-            "overlap in time after synthesis, leading to audio cutting off early."
+        def _short(text: str, limit: int = 40) -> str:
+            t = " ".join((text or "").split())
+            return t if len(t) <= limit else t[:limit].rstrip() + "\u2026"
+
+        _section(f"A. Overlapping fragments  ({len(overlaps)})")
+        hint_lbl = QLabel(
+            "Choose what to do with each overlapping pair: merge the two fragments "
+            "into one, or keep them as separate fragments.\n"
+            "The best option is preselected for every pair (Keep separate when it fits, "
+            "otherwise the option with the smaller overrun). Use Auto-select best to redo it.\n"
+            "Pairs whose text looks like one sentence split across fragments "
+            "(trailing ellipsis, comma, or no sentence-ending punctuation with a lowercase "
+            "continuation) are preselected as Merge regardless of the fit.\n"
+            "The Fit column shows whether the speech fits the available time for the "
+            "selected action: green = fits, yellow = up to 2x the slot, "
+            "orange = up to 4x the slot, red = more.\n"
+            "Values with ~ are estimated from text length; generate the voices to get exact values."
+            if overlaps else
+            "No overlapping fragments found."
         )
-        desc.setWordWrap(True)
-        desc.setStyleSheet(f"color:{C['text']};font-size:12px;")
-        lay.addWidget(desc)
+        hint_lbl.setWordWrap(True)
+        hint_lbl.setStyleSheet(f"color:{C['text3']};font-size:11px;")
+        lay.addWidget(hint_lbl)
 
-        separator = QFrame()
-        separator.setFrameShape(QFrame.Shape.HLine)
-        separator.setStyleSheet(f"color:{C['border']};")
-        lay.addWidget(separator)
+        tree = QTreeWidget()
+        tree.setColumnCount(5)
+        tree.setHeaderLabels(["Fragments", "Speakers", "Overlap", "Fit", "Action"])
+        tree.setRootIsDecorated(False)
+        tree.setWordWrap(True)
+        tree.setMinimumHeight(200)
+        header = tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        tree.setColumnWidth(4, 190)
+        lay.addWidget(tree, 1)
 
-        warn_lbl = QLabel("This action cannot be undone.")
-        warn_lbl.setStyleSheet(f"color:{C['error']};font-size:11px;font-style:italic;")
+        rows: List[Tuple[Dict, QComboBox, QTreeWidgetItem]] = []
+        fit_cache: Dict[int, Tuple[Optional[float], bool]] = {}
+        speech_rate = self._tc_speech_rate()
+        fit_colors = ["#55bb55", "#dddd00", "#ff8800", "#ff4444"]
+
+        def refresh_row_fit(item: QTreeWidgetItem, ov: Dict, combo: QComboBox):
+            sev, text, tip, _diff = self._tc_compute_fit(
+                ov['cur'], ov['nxt'], combo.currentData(),
+                rb_overlap.isChecked(), fit_cache, speech_rate,
+            )
+            item.setText(3, text)
+            item.setToolTip(3, tip)
+            if sev is not None:
+                item.setForeground(3, QColor(fit_colors[sev]))
+            else:
+                item.setForeground(3, QColor(C["text3"]))
+
+        for ov in overlaps:
+            cur = ov['cur']
+            nxt = ov['nxt']
+            label = (
+                f"#{cur['index'] + 1} \"{_short(cur.get('text'))}\"  \u2194  "
+                f"#{nxt['index'] + 1} \"{_short(nxt.get('text'))}\""
+            )
+            spk_cur = self._tc_speaker(cur) or "-"
+            spk_nxt = self._tc_speaker(nxt) or "-"
+            speakers = spk_cur if ov['same_speaker'] else f"{spk_cur} / {spk_nxt}"
+            item = QTreeWidgetItem([label, speakers, f"{ov['overlap_ms']} ms", "", ""])
+            tooltip_text = f"{cur.get('text', '')}\n---\n{nxt.get('text', '')}"
+            if self._tc_text_suggests_merge(cur, nxt):
+                tooltip_text += (
+                    "\n\nText looks like one sentence split across fragments "
+                    "- merge suggested."
+                )
+            item.setToolTip(0, tooltip_text)
+            tree.addTopLevelItem(item)
+
+            combo = QComboBox()
+            combo.addItem("Merge fragments", "merge")
+            combo.addItem("Keep separate", "keep")
+            combo.setCurrentIndex(max(0, combo.findData("keep")))
+            tree.setItemWidget(item, 4, combo)
+            rows.append((ov, combo, item))
+            combo.currentIndexChanged.connect(lambda _i: update_summary())
+
+        def set_all(action: str):
+            for _ov, combo, _item in rows:
+                idx = combo.findData(action)
+                if idx >= 0:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(idx)
+                    combo.blockSignals(False)
+            update_summary()
+
+        def auto_select():
+            allow_overlap = rb_overlap.isChecked()
+            for ov, combo, _item in rows:
+                action = self._tc_suggest_action(
+                    ov['cur'], ov['nxt'], allow_overlap, fit_cache, speech_rate
+                )
+                idx = combo.findData(action)
+                if idx >= 0:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(idx)
+                    combo.blockSignals(False)
+            update_summary()
+
+        bulk_row = QHBoxLayout()
+        bulk_row.setSpacing(6)
+        for text, action in (
+            ("Set all: Merge", "merge"),
+            ("Set all: Keep separate", "keep"),
+        ):
+            b = QPushButton(text)
+            b.setFixedHeight(26)
+            b.setStyleSheet("font-size:11px;padding:2px 8px;")
+            b.setEnabled(bool(rows))
+            b.clicked.connect(lambda _checked=False, a=action: set_all(a))
+            bulk_row.addWidget(b)
+        auto_btn = QPushButton("Auto-select (best for lektor)")
+        auto_btn.setFixedHeight(26)
+        auto_btn.setStyleSheet("font-size:11px;padding:2px 8px;")
+        auto_btn.setEnabled(bool(rows))
+        auto_btn.setToolTip(
+            "Choose the best action for every pair using the current timing option:\n"
+            "Text-based merge is preferred when fragments look like one sentence; "
+            "otherwise Keep separate when it fits, else the option with the smaller overrun."
+        )
+        auto_btn.clicked.connect(lambda _checked=False: auto_select())
+        bulk_row.addWidget(auto_btn)
+        bulk_row.addStretch()
+        lay.addLayout(bulk_row)
+
+        _section("B. Subtitle timing")
+        rb_overlap = QRadioButton(
+            "I want subtitles to overlap  (good for dubbing)"
+        )
+        rb_no_overlap = QRadioButton(
+            "I don't want subtitles to overlap  (good for lektor)"
+        )
+        rb_no_overlap.setChecked(True)
+        rb_overlap.setStyleSheet(f"color:{C['text']};font-size:12px;")
+        rb_no_overlap.setStyleSheet(f"color:{C['text']};font-size:12px;")
+        lay.addWidget(rb_overlap)
+        lay.addWidget(rb_no_overlap)
+        timing_lbl = QLabel(
+            "Overlap: gaps are closed, but fragments that already overlap are not changed, "
+            "e.g. 00:00:22,000 --> 00:00:23,200 and 00:00:23,000 --> 00:00:25,000 stay as they are.\n"
+            "No overlap: the end of every fragment is set to the start of the next fragment, "
+            "e.g. 00:00:22,000 --> 00:00:23,000 and 00:00:23,000 --> 00:00:25,000."
+        )
+        timing_lbl.setWordWrap(True)
+        timing_lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
+        lay.addWidget(timing_lbl)
+
+        _section("C. Summary")
+        summary_lbl = QLabel("")
+        summary_lbl.setWordWrap(True)
+        summary_lbl.setStyleSheet(f"color:{C['text']};font-size:12px;")
+        lay.addWidget(summary_lbl)
+
+        warn_lbl = QLabel("")
+        warn_lbl.setWordWrap(True)
+        warn_lbl.setStyleSheet(f"color:{C['warning']};font-size:11px;")
+        warn_lbl.setVisible(False)
         lay.addWidget(warn_lbl)
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
-
-        btn_all = QPushButton(f"Snap all  ({len(self._fragments)})")
-        btn_checked = QPushButton(f"Snap checked  ({checked_count})")
-        btn_cancel = QPushButton("Cancel")
-
-        btn_all.setStyleSheet(_btn(C["warning"]))
-        btn_checked.setStyleSheet(_btn(C["accent"]))
-        btn_checked.setEnabled(checked_count >= 1)
-
-        result = {"action": None}
-        btn_all.clicked.connect(lambda: (result.update({"action": "all"}), dlg.accept()))
-        btn_checked.clicked.connect(lambda: (result.update({"action": "checked"}), dlg.accept()))
-        btn_cancel.clicked.connect(dlg.reject)
-
+        undo_btn = QPushButton("\u21b6 Undo last correction")
+        undo_btn.setEnabled(getattr(self, '_time_corrector_undo', None) is not None)
+        undo_btn.setToolTip("Undo the last time correction")
+        apply_btn = QPushButton("Apply")
+        cancel_btn = QPushButton("Cancel")
+        apply_btn.setStyleSheet(_btn(C["accent"]))
+        btn_row.addWidget(undo_btn)
         btn_row.addStretch()
-        btn_row.addWidget(btn_all)
-        btn_row.addWidget(btn_checked)
-        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(apply_btn)
+        btn_row.addWidget(cancel_btn)
         lay.addLayout(btn_row)
 
-        dlg.adjustSize()
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
+        result: Dict = {}
 
-        if result["action"] == "all":
-            targets = self._fragments
-        elif result["action"] == "checked":
-            targets = sorted(
-                [f for f in self._fragments if f['index'] in checked_indices],
-                key=lambda f: f['index'],
+        def update_summary():
+            counts = {"merge": 0, "keep": 0}
+            merged_ids: set = set()
+            for ov, combo, _item in rows:
+                action = combo.currentData()
+                counts[action] = counts.get(action, 0) + 1
+                if action == "merge":
+                    merged_ids.add(id(ov['cur']))
+                    merged_ids.add(id(ov['nxt']))
+            done_count = sum(
+                1 for f in self._fragments
+                if id(f) in merged_ids and f.get('status') == 'done'
             )
-        else:
-            return
-
-        target_set = {f['index'] for f in targets}
-        changed = 0
-        for i in range(len(self._fragments) - 1):
-            current = self._fragments[i]
-            nxt = self._fragments[i + 1]
-            if current['index'] not in target_set:
-                continue
-            next_start = nxt.get('start_ms', 0) or 0
-            if (current.get('end_ms', 0) or 0) != next_start:
-                current['end_ms'] = next_start
-                current['srt_end_ms'] = next_start
-                current['timestamp'] = (
-                    f"{_ms_to_ts(current.get('start_ms', 0) or 0)} --> {_ms_to_ts(next_start)}"
+            allow_overlap = rb_overlap.isChecked()
+            if allow_overlap:
+                timing_changes = gap_count
+                timing_text = f"{gap_count} gap(s) to close, overlapping fragments left unchanged"
+            else:
+                timing_changes = gap_count + trim_count
+                timing_text = (
+                    f"{gap_count} gap(s) to close, {trim_count} overlap(s) to shorten"
                 )
-                self._update_tree_item(current['index'])
-                changed += 1
-
-        if changed:
-            self.main._set_status(
-                f"Snap timing: {changed} fragment(s) updated.", C["accent"]
+            summary_lbl.setText(
+                f"{counts['merge']} pair(s) to merge, "
+                f"{counts['keep']} kept separate, {timing_text}"
             )
-        else:
-            self.main._set_status("Snap timing: nothing to change.")
+            if done_count:
+                warn_lbl.setText(
+                    f"{done_count} already synthesized fragment(s) will be merged "
+                    f"\u2013 their audio will need to be regenerated"
+                )
+                warn_lbl.setVisible(True)
+            else:
+                warn_lbl.setVisible(False)
+            apply_btn.setEnabled(bool(counts['merge'] or timing_changes))
+            for ov, combo, item in rows:
+                refresh_row_fit(item, ov, combo)
+
+        def on_apply():
+            result["decisions"] = [
+                (ov['cur'], ov['nxt'], combo.currentData()) for ov, combo, _item in rows
+            ]
+            result["allow_overlap"] = rb_overlap.isChecked()
+            dlg.accept()
+
+        def on_undo():
+            result["undo"] = True
+            dlg.accept()
+
+        rb_overlap.toggled.connect(lambda _c: update_summary())
+        rb_no_overlap.toggled.connect(lambda _c: update_summary())
+        apply_btn.clicked.connect(on_apply)
+        undo_btn.clicked.connect(on_undo)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        auto_select()
+
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        if accepted and result.get("undo"):
+            self._time_corrector_undo_last()
+            return
+        if not accepted or "decisions" not in result:
+            return
+
+        self._time_corrector_apply(result["decisions"], result["allow_overlap"])
+
+    def _time_corrector_apply(self, decisions: List[Tuple[Dict, Dict, str]], allow_overlap: bool = False):
+        merge_pairs = [(c, n) for c, n, a in decisions if a == 'merge']
+        kept = sum(1 for _c, _n, a in decisions if a == 'keep')
+
+        position = {id(f): i for i, f in enumerate(self._fragments)}
+        merge_pairs.sort(key=lambda p: position.get(id(p[0]), 0))
+        member_groups: List[List[Dict]] = []
+        for cur, nxt in merge_pairs:
+            if member_groups and member_groups[-1][-1] is cur:
+                member_groups[-1].append(nxt)
+            else:
+                member_groups.append([cur, nxt])
+
+        has_merge = bool(member_groups)
+
+        if has_merge:
+            self.main._stop_play()
+            self._release_audio_file_locks()
+
+        try:
+            safety = snapshot_fragments(self._fragments, has_merge)
+        except Exception as e:
+            logger.error(f"Time corrector backup failed:\n{traceback.format_exc()}")
+            self.main._set_status(
+                f"Time corrector: could not back up audio files, nothing was changed: {e}",
+                C["error"],
+            )
+            return
+
+        undo_before = self._undo_begin(has_merge)
+
+        joined = 0
+        changed: Dict[int, Dict] = {}
+
+        try:
+            if member_groups:
+                infos: List[Dict] = []
+                for members in member_groups:
+                    text = ""
+                    for f in members:
+                        text = self._tc_join_text(text, f.get('text', ''))
+                    infos.append({
+                        'members': members,
+                        'text': text,
+                        'end_ms': max((f.get('end_ms', 0) or 0) for f in members),
+                    })
+                infos.sort(key=lambda g: g['members'][0]['index'], reverse=True)
+                for gi in infos:
+                    self._do_merge_srt_fragments(
+                        gi['members'],
+                        text_override=gi['text'],
+                        end_ms_override=gi['end_ms'],
+                        drop_audio=True,
+                        refresh=False,
+                    )
+
+            for i in range(len(self._fragments) - 1):
+                cur = self._fragments[i]
+                nxt = self._fragments[i + 1]
+                cur_start = cur.get('start_ms', 0) or 0
+                cur_end = cur.get('end_ms', 0) or 0
+                nxt_start = nxt.get('start_ms', 0) or 0
+                if nxt_start <= cur_start or nxt_start == cur_end:
+                    continue
+                if allow_overlap and nxt_start < cur_end:
+                    continue
+                cur['end_ms'] = nxt_start
+                cur['srt_end_ms'] = nxt_start
+                cur['timestamp'] = f"{_ms_to_ts(cur_start)} --> {_ms_to_ts(nxt_start)}"
+                joined += 1
+                changed[id(cur)] = cur
+
+            if member_groups:
+                self._rename_outputs_to_match_order()
+                self._tc_reset_current_fragment()
+                self._populate_tree()
+                self.main._update_action_buttons()
+            else:
+                for frag in changed.values():
+                    self._update_tree_item(frag['index'])
+        except Exception as e:
+            logger.error(f"Time corrector failed:\n{traceback.format_exc()}")
+            rolled_back = False
+            try:
+                self._release_audio_file_locks()
+                self._undo_restore(safety)
+                rolled_back = True
+            except Exception:
+                logger.error(f"Time corrector rollback failed:\n{traceback.format_exc()}")
+            if rolled_back:
+                discard_snapshot(safety)
+                discard_snapshot(undo_before)
+                self.main._set_status(
+                    f"Time corrector failed, changes were rolled back: {e}", C["error"]
+                )
+            else:
+                logger.error(f"Safety backup kept in: {safety.get('backup_dir')}")
+                self.main._set_status(
+                    f"Time corrector failed and rollback failed. Backup kept in: {safety.get('backup_dir')}",
+                    C["error"],
+                )
+            return
+
+        if not (member_groups or joined):
+            discard_snapshot(safety)
+            discard_snapshot(undo_before)
+            self.main._set_status("Time corrector: nothing to change.")
+            return
+
+        old = getattr(self, '_time_corrector_undo', None)
+        self._time_corrector_undo = {
+            'state': safety,
+            'srt_path': self._srt_path,
+            'has_merge': has_merge,
+            'post_refs': list(self._fragments),
+        }
+        if old is not None:
+            discard_snapshot(old.get('state'))
+        self._tc_refresh_undo_button()
+
+        self._undo_commit("time correction", undo_before)
+        self.main._set_status(
+            f"Time corrector: {len(member_groups)} group(s) merged, "
+            f"{joined} timestamp(s) joined, {kept} kept separate.",
+            C["accent"],
+        )
+
+    def _time_corrector_undo_last(self):
+        snapshot = getattr(self, '_time_corrector_undo', None)
+        if snapshot is None:
+            self._tc_refresh_undo_button()
+            return
+        if self._is_running:
+            self.main._set_status("Time corrector: stop synthesis before undoing.")
+            return
+
+        post_refs = snapshot['post_refs']
+        unchanged = (
+            snapshot['srt_path'] == self._srt_path
+            and len(post_refs) == len(self._fragments)
+            and all(a is b for a, b in zip(post_refs, self._fragments))
+        )
+        if not unchanged:
+            self._time_corrector_undo = None
+            self._tc_refresh_undo_button()
+            self.main._set_status(
+                "Time corrector: cannot undo, fragments were changed after the correction.",
+                C["warning"],
+            )
+            return
+
+        undo_before = self._undo_begin(snapshot['has_merge'])
+
+        self.main._stop_play()
+        self._release_audio_file_locks()
+        self._dub_hold_until = float('inf')
+        try:
+            try:
+                self._undo_restore(snapshot['state'])
+            except Exception as e:
+                logger.error(f"Time corrector undo failed:\n{traceback.format_exc()}")
+                self.main._set_status(
+                    f"Time corrector undo failed, backup kept: {e}", C["error"]
+                )
+                return
+            discard_snapshot(snapshot['state'])
+            self._time_corrector_undo = None
+            self._tc_refresh_undo_button()
+            self._undo_commit("undo of time correction", undo_before)
+            self.main._set_status("Time corrector: last correction undone.", C["accent"])
+        finally:
+            self._dub_hold_until = 0.0
 
     def _show_timing_issues_dialog(self):
         from widgets import TimingIssuesDialog
@@ -2093,38 +3102,36 @@ class SrtTab(BaseTab):
         try:
             for i in range(self._chapter_item.childCount()):
                 child = self._chapter_item.child(i)
-                if child.isHidden():
-                    continue
                 idx = child.data(COL_STATUS, Qt.ItemDataRole.UserRole)
                 if idx is None:
                     continue
-                frag = frag_map.get(idx)
-                if not frag or frag.get('status') != 'done':
-                    continue
 
-                dur = _get_wav_duration(frag.get('output_path', ''))
-                if dur is None:
-                    continue
+                match = False
+                if not child.isHidden():
+                    frag = frag_map.get(idx)
+                    if frag and frag.get('status') == 'done':
+                        dur = _get_wav_duration(frag.get('output_path', ''))
+                        if dur is not None:
+                            start_ms = frag.get('start_ms', 0) or 0
+                            end_ms = frag.get('srt_end_ms', frag.get('end_ms', 0)) or 0
+                            slot_s = (end_ms - start_ms) / 1000.0
+                            if dur > slot_s:
+                                safe_slot = max(slot_s, 0.001)
+                                if dur < 2 * safe_slot:
+                                    match = select_yellow
+                                elif dur < 4 * safe_slot:
+                                    match = select_orange
+                                else:
+                                    match = select_red
 
-                slot_s = ((frag.get('end_ms', 0) or 0) - (frag.get('start_ms', 0) or 0)) / 1000.0
-                if slot_s <= 0:
-                    continue
-
-                ratio = dur / max(slot_s, 0.001)
-
-                color_match = False
-                if select_yellow and 1.0 < ratio < 2.0:
-                    color_match = True
-                elif select_orange and 2.0 <= ratio < 4.0:
-                    color_match = True
-                elif select_red and ratio >= 4.0:
-                    color_match = True
-
-                if color_match:
-                    child.setCheckState(COL_STATUS, Qt.CheckState.Checked)
+                child.setCheckState(
+                    COL_STATUS,
+                    Qt.CheckState.Checked if match else Qt.CheckState.Unchecked,
+                )
         finally:
             self._tree.blockSignals(False)
             self._tree.setUpdatesEnabled(True)
+        self._sync_checks_from_tree()
 
     # ------------------------------------------------------------------
     # Speaker UI / Dubbing
@@ -2186,8 +3193,8 @@ class SrtTab(BaseTab):
                 sv["player"].load(path)
                 sv["proc_btn"].setEnabled(True)
                 sv["tr_btn"].setEnabled(
-                    self.whisper is not None
-                    and self.whisper.is_downloaded(self.main._w_size.currentData())
+                    self.main._whisper_backend is not None
+                    and self.main._whisper_backend.is_downloaded(self.main._w_size.currentData())
                 )
 
         for spk, text in saved_texts.items():
@@ -2304,6 +3311,8 @@ class SrtTab(BaseTab):
         key = 'prefix' if is_prepend else 'suffix'
         mode_word = "prefix" if is_prepend else "suffix"
 
+        before = self._undo_begin()
+
         for frag in self._fragments:
             if frag['index'] not in checked_indices:
                 continue
@@ -2311,6 +3320,8 @@ class SrtTab(BaseTab):
             frag['status'] = 'waiting'
             frag['error_msg'] = None
             self._update_tree_item(frag['index'])
+
+        self._undo_commit(f"{mode_word} change on {len(checked_indices)} fragment(s)", before)
 
         if new_text:
             self.main._set_status(
@@ -2380,9 +3391,11 @@ class SrtTab(BaseTab):
 
     def _edit_speaker(self, frag: Dict, clear: bool = False):
         if clear:
+            before = self._undo_begin()
             frag['speaker'] = None
             self._update_tree_item(frag['index'])
             self._sync_speaker_ui_from_fragments()
+            self._undo_commit(f"speaker removal on fragment #{frag['index'] + 1}", before)
             return
 
         current = frag.get('speaker') or ""
@@ -2392,9 +3405,11 @@ class SrtTab(BaseTab):
             current,
         )
         if ok:
+            before = self._undo_begin()
             frag['speaker'] = name.strip() or None
             self._update_tree_item(frag['index'])
             self._sync_speaker_ui_from_fragments()
+            self._undo_commit(f"speaker change on fragment #{frag['index'] + 1}", before)
 
     def _set_speaker_for_selected(self):
         if not self._fragments or not self._chapter_item:
@@ -2428,11 +3443,13 @@ class SrtTab(BaseTab):
             return
 
         new_speaker = name.strip() or None
+        before = self._undo_begin()
         for frag in checked_frags:
             frag['speaker'] = new_speaker
             self._update_tree_item(frag['index'])
 
         self._sync_speaker_ui_from_fragments()
+        self._undo_commit(f"speaker change on {len(checked_frags)} fragment(s)", before)
         self.main._set_status(
             f"Speaker {'set to ' + new_speaker if new_speaker else 'cleared'} "
             f"for {len(checked_frags)} fragment(s).",
@@ -2888,8 +3905,8 @@ class SrtTab(BaseTab):
         sv["proc_btn"].setEnabled(True)
         w_size_combo = sv.get("w_size", self.main._w_size)
         sv["tr_btn"].setEnabled(
-            self.whisper is not None
-            and self.whisper.is_downloaded(w_size_combo.currentData())
+            self.main._whisper_backend is not None
+            and self.main._whisper_backend.is_downloaded(w_size_combo.currentData())
         )
         info = _audio_info_str(path)
         sv["audio_info_lbl"].setText(info)
@@ -2924,7 +3941,7 @@ class SrtTab(BaseTab):
         w_size_combo = sv.get("w_size", self.main._w_size)
         size = w_size_combo.currentData()
 
-        if not self.whisper.is_downloaded(size):
+        if not self.main._whisper_backend.is_downloaded(size):
             reply = QMessageBox.question(
                 self.main, f"Download Whisper {size}",
                 f"Whisper {size} ({WHISPER_SIZE_MB.get(size, '')}) is not downloaded.\n"
@@ -2944,7 +3961,7 @@ class SrtTab(BaseTab):
         self._progress.setVisible(True)
         self._progress.setRange(0, 0)
 
-        self._w_tr = TranscribeWorker(self.whisper, path, size, lang)
+        self._w_tr = TranscribeWorker(self.main._whisper_backend, path, size, lang)
         self._w_tr.status.connect(lambda m: self.main._set_status(m))
         self._w_tr.finished.connect(
             lambda text, s=speaker: self._on_speaker_transcribe_done(s, text)
@@ -2995,6 +4012,7 @@ class SrtTab(BaseTab):
 
         mono_chk = sv.get("mono_check", self.main._mono_check)
         sr_cbo = sv.get("sr_combo", self.main._sr_combo)
+        backend = self.main._backend
 
         settings = {
             "target_sr": sr_cbo.currentData(),
@@ -3003,7 +4021,7 @@ class SrtTab(BaseTab):
             "normalize": True,
             "output_subtype": output_subtype,
             "device": "cuda" if (
-                self.backend and self.backend.device == "cuda"
+                backend and backend.device == "cuda"
             ) else "cpu",
             "output_name": output_name,
         }
@@ -3013,7 +4031,7 @@ class SrtTab(BaseTab):
         self._progress.setVisible(True)
         self._progress.setRange(0, 0)
 
-        self._w_proc = AudioProcessWorker(self.preprocessor, path, settings)
+        self._w_proc = AudioProcessWorker(self.main._preprocessor, path, settings)
         self._w_proc.status.connect(lambda m: self.main._set_status(m))
         self._w_proc.finished.connect(
             lambda out, s=speaker: self._on_speaker_proc_done(s, out)
@@ -3039,8 +4057,8 @@ class SrtTab(BaseTab):
         sv["player"].load(out)
         w_size_combo = sv.get("w_size", self.main._w_size)
         sv["tr_btn"].setEnabled(
-            self.whisper is not None
-            and self.whisper.is_downloaded(w_size_combo.currentData())
+            self.main._whisper_backend is not None
+            and self.main._whisper_backend.is_downloaded(w_size_combo.currentData())
         )
         self.main._set_status(
             f"[{speaker}] Audio processed: {Path(out).name}", C["success"]
@@ -3088,16 +4106,27 @@ class SrtTab(BaseTab):
     # ------------------------------------------------------------------
 
     def _on_media_status_changed(self, status):
-        if status == QMediaPlayer.MediaStatus.LoadedMedia:
-            self._media_player.play()
-            self._media_player.pause()
+        if status != QMediaPlayer.MediaStatus.LoadedMedia:
+            return
+        if self.main._video_player.is_playing():
+            if self._media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                self._media_player.play()
+            return
+        self._media_player.play()
+        self._media_player.pause()
 
     def _on_show_video_waveform(self):
+        if getattr(self, '_video_open', False):
+            self._close_video()
+            return
+
         external_audio = self._audio_path_edit.text().strip()
         if external_audio and os.path.exists(external_audio):
             self.main._video_player.load(external_audio)
             self.main._video_player.setVisible(True)
             self.main._video_source_path = None
+            self._video_open = True
+            self._btn_show_video_wave.setText("✕  Close video")
             self.main._set_status(f"Loaded external audio: {Path(external_audio).name}", C["success"])
             return
 
@@ -3114,6 +4143,7 @@ class SrtTab(BaseTab):
             return
         _set_last_dir("video", path)
         self.main._video_source_path = path
+        self._video_open = True
 
         if getattr(self, '_media_player', None) is not None:
             self._media_player.setSource(QUrl.fromLocalFile(path))
@@ -3143,8 +4173,7 @@ class SrtTab(BaseTab):
         self._w_vid_extract.error.connect(
             lambda e: self.main._on_error("Video audio extraction error", e,
                                            reset_fn=lambda: (
-                                               self._btn_show_video_wave.setEnabled(True),
-                                               self._btn_show_video_wave.setText("🎬  Show Waveform from video"),
+                                               self._close_video(),
                                                self._progress.setVisible(False),
                                            ))
         )
@@ -3153,7 +4182,7 @@ class SrtTab(BaseTab):
     def _on_video_audio_extracted(self, wav_path: str):
         self._progress.setVisible(False)
         self._btn_show_video_wave.setEnabled(True)
-        self._btn_show_video_wave.setText("🎬  Show Waveform from video")
+        self._btn_show_video_wave.setText("✕  Close video")
         self.main._video_player.load(wav_path)
         if self.main._video_source_path:
             self._vid_path_edit.setText(self.main._video_source_path)
@@ -3162,6 +4191,64 @@ class SrtTab(BaseTab):
         self.main._set_status(
             f"Video audio loaded: {Path(self.main._video_source_path).name}", C["success"]
         )
+
+    def _close_video(self):
+        win = getattr(self, '_fs_window', None)
+        if win is not None:
+            win.leave()
+
+        player = self.main._video_player
+        for sig, slot in (
+            (player.playback_state_changed, self._sync_video_playback),
+            (player.position_updated, self._sync_video_position),
+        ):
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+
+        if getattr(self, '_dub_player', None) is not None:
+            self._dub_player.stop()
+            self._dub_player.setSource(QUrl())
+        if getattr(self, '_media_player', None) is not None:
+            self._media_player.stop()
+            self._media_player.setSource(QUrl())
+
+        self._current_sim_frag_idx = None
+        self._last_sim_pos_ms = None
+        self._dub_schedule_sig = None
+
+        player.clear()
+
+        prev = getattr(self, '_hl_item', None)
+        if prev is not None:
+            self._tree.blockSignals(True)
+            try:
+                for col in range(self._tree.columnCount()):
+                    prev.setBackground(col, QBrush())
+            except RuntimeError:
+                pass
+            finally:
+                self._tree.blockSignals(False)
+            self._hl_item = None
+
+        self._video_loaded = False
+        self._video_open = False
+        self._update_video_preview_visibility()
+        if getattr(self, '_video_section', None) is not None:
+            self._video_section.set_enabled(False)
+
+        src = self.main._video_source_path
+        self.main._video_source_path = None
+        if not self._dubbing_mode:
+            if src and self._vid_path_edit.text().strip() == src:
+                self._vid_path_edit.setText("")
+                self._update_video_info()
+            self._vid_row_widget.setVisible(True)
+
+        self._btn_show_video_wave.setEnabled(True)
+        self._btn_show_video_wave.setText("🎬  Show video")
+        self.main._set_status("Video closed.")
 
     # ------------------------------------------------------------------
     # Lektor Export
@@ -3230,6 +4317,36 @@ class SrtTab(BaseTab):
         except Exception:
             return ""
 
+    def _get_overlap_mode(self) -> str:
+        combo = getattr(self, '_overlap_combo', None)
+        if combo is None:
+            return "never"
+        mode = combo.currentData()
+        return mode if mode in ("never", "speakers", "always") else "never"
+
+    def _fragment_start_with_overlap(self, mode: str, speaker, desired, cursors: Dict[str, float]):
+        if mode == "always":
+            return desired
+        key = str(speaker or "").strip() if mode == "speakers" else ""
+        return max(desired, cursors.get(key, 0))
+
+    def _advance_overlap_cursor(self, mode: str, speaker, end, cursors: Dict[str, float]) -> None:
+        if mode == "always":
+            return
+        key = str(speaker or "").strip() if mode == "speakers" else ""
+        cursors[key] = end
+
+    def _atempo_target_ms(self, slot_ms: float, audio_dur_ms: float) -> Optional[float]:
+        if slot_ms <= 0 or audio_dur_ms <= slot_ms:
+            return None
+        overshoot_ms = audio_dur_ms - slot_ms
+        if overshoot_ms <= self._atempo_threshold.value():
+            return float(slot_ms)
+        halve_check = getattr(self, '_atempo_halve_check', None)
+        if halve_check is not None and halve_check.isChecked():
+            return slot_ms + overshoot_ms / 2.0
+        return None
+
     def _build_lektor_audio_track(self, output_path: str,
                                    sample_rate: int = 44100,
                                    offset_ms: int = 0) -> bool:
@@ -3248,7 +4365,6 @@ class SrtTab(BaseTab):
         done_frags = sorted(done_frags, key=lambda f: f.get('start_ms', 0) or 0)
 
         autofit = self.main._ffmpeg_ok and self._autofit_check.isChecked()
-        atempo_thresh = self._atempo_threshold.value()
         tmp_files: List[str] = []
 
         max_end_ms = max((f.get('end_ms') or f.get('start_ms', 0)) for f in done_frags)
@@ -3257,7 +4373,8 @@ class SrtTab(BaseTab):
         total_duration_s = max(max_end_ms / 1000.0, total_audio_s) + abs(offset_ms) / 1000.0 + 10.0
         total_samples = int(total_duration_s * sample_rate)
         track = np.zeros(total_samples, dtype=np.float32)
-        cursor_sample = 0
+        overlap_mode = self._get_overlap_mode()
+        cursors: Dict[str, int] = {}
 
         for frag in done_frags:
             raw_start_ms = frag.get('start_ms', 0) or 0
@@ -3271,17 +4388,19 @@ class SrtTab(BaseTab):
             audio_dur_s = _get_wav_duration(audio_file) or 0.0
             audio_dur_ms = int(audio_dur_s * 1000)
 
-            if slot_ms > 0 and audio_dur_ms > slot_ms:
-                overshoot_ms = audio_dur_ms - slot_ms
-                if autofit and overshoot_ms <= atempo_thresh:
-                    fitted = self._fit_audio_to_slot(audio_file, slot_ms)
+            if autofit:
+                target_ms = self._atempo_target_ms(slot_ms, audio_dur_ms)
+                if target_ms is not None:
+                    fitted = self._fit_audio_to_slot(audio_file, int(target_ms))
                     if fitted:
                         tmp_files.append(fitted)
                         audio_file = fitted
-                        audio_dur_ms = slot_ms
+                        audio_dur_ms = int(target_ms)
 
             srt_start_sample = max(0, int(adj_start_ms / 1000.0 * sample_rate))
-            start_sample = max(srt_start_sample, cursor_sample)
+            start_sample = self._fragment_start_with_overlap(
+                overlap_mode, frag.get('speaker'), srt_start_sample, cursors
+            )
 
             try:
                 frag_audio, frag_sr = sf.read(audio_file, dtype="float32", always_2d=False)
@@ -3294,7 +4413,7 @@ class SrtTab(BaseTab):
                 frag_audio = (frag_audio / frag_max * 0.92).astype(np.float32)
                 waveform = frag_audio
                 if frag_sr != sample_rate:
-                    waveform, _ = self.preprocessor._resample(waveform, frag_sr, sample_rate)
+                    waveform, _ = self.main._preprocessor._resample(waveform, frag_sr, sample_rate)
             except Exception as e:
                 logger.warning(f"Cannot load {audio_file}: {e}")
                 continue
@@ -3309,14 +4428,20 @@ class SrtTab(BaseTab):
                 track = grown
                 logger.info(f"Lektor track buffer extended to {required_samples / sample_rate:.1f}s")
 
-            track[start_sample:required_samples] = waveform
-            cursor_sample = required_samples
+            track[start_sample:required_samples] += waveform
+            self._advance_overlap_cursor(overlap_mode, frag.get('speaker'), required_samples, cursors)
 
         for tmp in tmp_files:
             try:
                 os.remove(tmp)
             except Exception:
                 pass
+
+        if overlap_mode != "never":
+            over = np.abs(track) > 0.92
+            if over.any():
+                excess = np.abs(track[over]) - 0.92
+                track[over] = np.sign(track[over]) * (0.92 + 0.08 * np.tanh(excess / 0.08))
 
         max_val = float(np.abs(track).max())
         logger.info(f"Lektor track peak amplitude before final normalize: {max_val:.6f}")
@@ -3843,9 +4968,14 @@ class SrtTab(BaseTab):
     def _save_session(self):
         if not self._srt_path:
             return
-        default_path = str(
-            Path(_get_last_dir("session", str(OUTPUTS_DIR))) / "session.json"
-        )
+        user_path = self._user_session_path()
+        if user_path is not None:
+            os.makedirs(os.path.dirname(str(user_path)), exist_ok=True)
+            default_path = str(user_path)
+        else:
+            default_path = str(
+                Path(_get_last_dir("session", str(OUTPUTS_DIR))) / "session.json"
+            )
         path, _ = QFileDialog.getSaveFileName(
             self.main, "Save session", default_path,
             "JSON (*.json);;All files (*)",
@@ -3853,13 +4983,14 @@ class SrtTab(BaseTab):
         if not path:
             return
         _set_last_dir("session", path)
-        if self._write_session_to(path):
-            auto = self._auto_session_path()
-            if auto and str(auto) != path:
-                self._write_session_to(str(auto))
+        if self._write_manual_session_to(path):
             self.main._set_status(f"Session saved: {path}", C["success"])
         else:
-            QMessageBox.critical(self.main, "Save error", f"Could not write session to:\n{path}")
+            QMessageBox.critical(
+                self.main, "Save error",
+                f"Could not write session to:\n{path}\n\n"
+                "A manual session cannot be saved into the autosession folder."
+            )
 
     def _load_session(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -3876,16 +5007,40 @@ class SrtTab(BaseTab):
             QMessageBox.critical(self.main, "Load error", str(e))
             return
 
+        self.main.undo_manager.clear()
         if data.get("session_type") == "ebook":
             self.main.ebook_tab._restore_ebook_session_data(data)
         else:
             self._reset_dubbing_state()
             self._restore_session_data(data)
 
-    def _auto_session_path(self) -> Optional[Path]:
+    @staticmethod
+    def _session_dirs(srt_path: str) -> Tuple[Path, Path]:
+        stem = Path(srt_path).stem
+        root = Path(OUTPUTS_DIR) / stem
+        return root / stem, root / f"{stem}_autosession"
+
+    def _manual_session_dir(self) -> Optional[Path]:
         if not self._srt_path:
             return None
-        return OUTPUTS_DIR / Path(self._srt_path).stem / "session.json"
+        return self._session_dirs(self._srt_path)[0]
+
+    def _auto_session_dir(self) -> Optional[Path]:
+        if not self._srt_path:
+            return None
+        return self._session_dirs(self._srt_path)[1]
+
+    def _auto_session_path(self) -> Optional[Path]:
+        auto_dir = self._auto_session_dir()
+        if auto_dir is None:
+            return None
+        return auto_dir / "autosession.json"
+
+    def _user_session_path(self) -> Optional[Path]:
+        manual_dir = self._manual_session_dir()
+        if manual_dir is None:
+            return None
+        return manual_dir / "session.json"
 
     def _build_session_data(self) -> dict:
         freq: Dict[str, int] = {}
@@ -3954,6 +5109,7 @@ class SrtTab(BaseTab):
                 "keep_original_track": self._keep_original_track_check.isChecked(),
                 "dubbed_lang": self._dubbed_lang_edit.text().strip(),
                 "video_format": self._lektor_vid_fmt_combo.currentData(),
+                "overlap_mode": self._get_overlap_mode(),
             },
             "dubbing_mode": self._dubbing_mode,
             "dubbing_video_path": self._dubbing_video_path,
@@ -3975,7 +5131,214 @@ class SrtTab(BaseTab):
             logger.warning(f"Session write failed: {e}")
             return False
 
+    def _write_manual_session_to(self, path: str) -> bool:
+        def _norm(p: str) -> str:
+            return os.path.normcase(os.path.abspath(p))
+
+        try:
+            target_dir = os.path.dirname(os.path.abspath(path))
+            auto_dir = self._auto_session_dir()
+            if auto_dir is not None and _norm(str(auto_dir)) == _norm(target_dir):
+                logger.warning("Manual session cannot be written into the autosession folder")
+                return False
+            os.makedirs(target_dir, exist_ok=True)
+
+            previous: Set[str] = set()
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        old_data = json.load(fh)
+                    for old_frag in old_data.get("fragments", []):
+                        old_path = old_frag.get("output_path")
+                        if old_path and os.path.dirname(_norm(old_path)) == _norm(target_dir):
+                            previous.add(_norm(old_path))
+                except Exception:
+                    previous = set()
+
+            data = self._build_session_data()
+            mapping: Dict[str, str] = {}
+            used: Set[str] = set()
+            for frag in data["fragments"]:
+                src = frag.get("output_path")
+                if not src or not os.path.isfile(src):
+                    continue
+                key = _norm(src)
+                if key not in mapping:
+                    dst = os.path.join(target_dir, os.path.basename(src))
+                    root, ext = os.path.splitext(dst)
+                    n = 1
+                    while _norm(dst) in used:
+                        dst = f"{root}_{n}{ext}"
+                        n += 1
+                    if _norm(dst) != key:
+                        shutil.copy2(src, dst)
+                    used.add(_norm(dst))
+                    mapping[key] = dst
+                frag["output_path"] = mapping[key]
+            data["output_dir"] = target_dir
+
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False)
+
+            prefix = Path(self._srt_path).stem if self._srt_path else ""
+            audio_exts = {".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a"}
+            delete_targets: Set[str] = set(previous)
+            if prefix:
+                try:
+                    for entry in os.scandir(target_dir):
+                        if not entry.is_file():
+                            continue
+                        ext = os.path.splitext(entry.name)[1].lower()
+                        if ext not in audio_exts:
+                            continue
+                        name = entry.name
+                        if (
+                            name.startswith(prefix + "_")
+                            or name.startswith("__merge_tmp_")
+                            or name.startswith("_lektor_track_tmp")
+                        ):
+                            delete_targets.add(_norm(entry.path))
+                except OSError:
+                    pass
+
+            for stale in delete_targets - used:
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+            return True
+        except Exception as e:
+            logger.warning(f"Manual session write failed: {e}")
+            return False
+
+    def _recover_missing_audio(self, data: dict) -> dict:
+        srt_path = data.get("srt_path") or ""
+        if not srt_path:
+            return data
+
+        def _norm(p: str) -> str:
+            return os.path.normcase(os.path.abspath(p))
+
+        stem = Path(srt_path).stem
+        candidate_dirs: List[str] = []
+        seen: Set[str] = set()
+        for raw in (
+            str(Path(OUTPUTS_DIR) / stem / stem),
+            str(Path(OUTPUTS_DIR) / stem / f"{stem}_autosession"),
+            data.get("output_dir") or "",
+        ):
+            if not raw:
+                continue
+            ad = os.path.abspath(raw)
+            if not os.path.isdir(ad):
+                continue
+            key = _norm(ad)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidate_dirs.append(ad)
+
+        if not candidate_dirs:
+            return data
+
+        fragments = [dict(f) for f in data.get("fragments", [])]
+        changed = False
+        for frag in fragments:
+            existing = frag.get("output_path")
+            if existing:
+                try:
+                    if os.path.isfile(existing) and os.path.getsize(existing) > 0:
+                        continue
+                except OSError:
+                    pass
+            idx = frag.get("index")
+            if idx is None:
+                continue
+            try:
+                idx_int = int(idx)
+            except (TypeError, ValueError):
+                continue
+            expected_name = f"{stem}_{idx_int + 1:03d}.wav"
+            for d in candidate_dirs:
+                candidate = os.path.join(d, expected_name)
+                try:
+                    if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                        frag["output_path"] = candidate
+                        frag["status"] = "done"
+                        frag["error_msg"] = None
+                        changed = True
+                        logger.info(
+                            f"Recovered missing audio for fragment #{idx_int + 1}: {candidate}"
+                        )
+                        break
+                except OSError:
+                    continue
+
+        if not changed:
+            return data
+
+        result = dict(data)
+        result["fragments"] = fragments
+        return result
+
+    def _relocate_session_data(self, data: dict) -> dict:
+        srt_path = data.get("srt_path") or ""
+        if not srt_path:
+            return data
+        data = self._recover_missing_audio(data)
+
+        def _norm(p: str) -> str:
+            return os.path.normcase(os.path.abspath(p))
+
+        auto_dir = os.path.abspath(str(self._session_dirs(srt_path)[1]))
+        auto_key = _norm(auto_dir)
+        fragments = [dict(f) for f in data.get("fragments", [])]
+
+        sources = [
+            f["output_path"] for f in fragments
+            if f.get("output_path") and os.path.isfile(f["output_path"])
+        ]
+        if any(os.path.dirname(_norm(s)) != auto_key for s in sources):
+            self._release_audio_file_locks()
+
+        os.makedirs(auto_dir, exist_ok=True)
+        used: Set[str] = {_norm(s) for s in sources if os.path.dirname(_norm(s)) == auto_key}
+        mapping: Dict[str, Optional[str]] = {}
+        for frag in fragments:
+            src = frag.get("output_path")
+            if not src or not os.path.isfile(src):
+                continue
+            key = _norm(src)
+            if key not in mapping:
+                if os.path.dirname(key) == auto_key:
+                    mapping[key] = src
+                else:
+                    dst = os.path.join(auto_dir, os.path.basename(src))
+                    root, ext = os.path.splitext(dst)
+                    n = 1
+                    while _norm(dst) in used:
+                        dst = f"{root}_{n}{ext}"
+                        n += 1
+                    try:
+                        shutil.copy2(src, dst)
+                        used.add(_norm(dst))
+                        mapping[key] = dst
+                    except OSError as e:
+                        logger.warning(f"Could not copy {src} to {dst}: {e}")
+                        mapping[key] = None
+            frag["output_path"] = mapping[key]
+            if mapping[key] is None:
+                frag["status"] = "waiting"
+
+        result = dict(data)
+        result["fragments"] = fragments
+        result["output_dir"] = auto_dir
+        return result
+
     def _restore_session_data(self, data: dict):
+        self._apply_session_data(self._relocate_session_data(data))
+
+    def _apply_session_data(self, data: dict):
         self._srt_path = data.get("srt_path", "")
         self._output_dir = data.get("output_dir", str(OUTPUTS_DIR))
         self._fragments = data.get("fragments", [])
@@ -4073,6 +5436,12 @@ class SrtTab(BaseTab):
                     self._lektor_vid_fmt_combo.setCurrentIndex(i)
                     break
 
+        overlap_mode = lektor.get("overlap_mode", "never")
+        for i in range(self._overlap_combo.count()):
+            if self._overlap_combo.itemData(i) == overlap_mode:
+                self._overlap_combo.setCurrentIndex(i)
+                break
+
         dubbing_mode = data.get("dubbing_mode", False)
         if dubbing_mode:
             self._dubbing_mode = True
@@ -4099,8 +5468,8 @@ class SrtTab(BaseTab):
 
             speaker_voices_data = data.get("speaker_voices", {})
             whisper_ready = (
-                self.whisper is not None
-                and self.whisper.is_downloaded(self.main._w_size.currentData())
+                self.main._whisper_backend is not None
+                and self.main._whisper_backend.is_downloaded(self.main._w_size.currentData())
             )
             is_supertonic = self.main._is_supertonic_active()
             is_piper = self.main._is_piper_active()
@@ -4249,6 +5618,33 @@ class SrtTab(BaseTab):
         lay.addLayout(row)
 
         row = QHBoxLayout()
+        lbl = QLabel("Overlap:")
+        lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
+        lbl.setFixedWidth(70)
+        self._overlap_combo = QComboBox()
+        self._overlap_combo.addItem("Never", "never")
+        self._overlap_combo.addItem("Different speakers only", "speakers")
+        self._overlap_combo.addItem("Always", "always")
+        self._overlap_combo.setToolTip(
+            "Controls whether synthesized fragments may play at the same time.\n\n"
+            "Never: a fragment is delayed until the previous one has finished (single narrator).\n"
+            "Different speakers only: fragments of different speakers may overlap, "
+            "but one speaker never overlaps themselves. Fragments without a speaker "
+            "count as a single narrator.\n"
+            "Always: every fragment starts exactly at its subtitle time, even if it "
+            "overlaps another one.\n\n"
+            "Applies to the exported video and to the dubbing simulation in the video preview."
+        )
+        row.addWidget(lbl)
+        row.addWidget(self._overlap_combo, 1)
+        lay.addLayout(row)
+
+        vol_spin_style = (
+            f"QSpinBox {{ color:{C['accent']}; font-size:11px; "
+            f"border:1px solid {C['border']}; border-radius:3px; padding:1px 3px; }}"
+        )
+
+        row = QHBoxLayout()
         lbl = QLabel("Lektor volume:")
         lbl.setStyleSheet(f"color:{C['text2']};font-size:11px;")
         lbl.setFixedWidth(70)
@@ -4256,9 +5652,17 @@ class SrtTab(BaseTab):
         self._lektor_vol.setRange(0, 200)
         self._lektor_vol.setValue(100)
         self._lektor_vol.setFixedWidth(120)
-        self._lektor_vol_lbl = QLabel("100%")
-        self._lektor_vol_lbl.setStyleSheet(f"color:{C['accent']};font-size:11px;")
-        self._lektor_vol.valueChanged.connect(lambda v: self._lektor_vol_lbl.setText(f"{v}%"))
+        self._lektor_vol_spin = QSpinBox()
+        self._lektor_vol_spin.setRange(0, 200)
+        self._lektor_vol_spin.setValue(100)
+        self._lektor_vol_spin.setSuffix("%")
+        self._lektor_vol_spin.setFixedWidth(64)
+        self._lektor_vol_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self._lektor_vol_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lektor_vol_spin.setStyleSheet(vol_spin_style)
+        self._lektor_vol_spin.setToolTip("Type the exact lektor volume in percent (0-200%).")
+        self._lektor_vol.valueChanged.connect(self._lektor_vol_spin.setValue)
+        self._lektor_vol_spin.valueChanged.connect(self._lektor_vol.setValue)
         self._lektor_vol.setToolTip(
             "Volume of the synthesized (lektor) speech track in the final video.\n"
             "100% = original level, 50% = half volume, 150% = louder.\n"
@@ -4266,7 +5670,7 @@ class SrtTab(BaseTab):
         )
         row.addWidget(lbl)
         row.addWidget(self._lektor_vol)
-        row.addWidget(self._lektor_vol_lbl)
+        row.addWidget(self._lektor_vol_spin)
         row.addStretch()
         lay.addLayout(row)
 
@@ -4278,9 +5682,17 @@ class SrtTab(BaseTab):
         self._orig_vol.setRange(0, 200)
         self._orig_vol.setValue(100)
         self._orig_vol.setFixedWidth(120)
-        self._orig_vol_lbl = QLabel("100%")
-        self._orig_vol_lbl.setStyleSheet(f"color:{C['accent']};font-size:11px;")
-        self._orig_vol.valueChanged.connect(lambda v: self._orig_vol_lbl.setText(f"{v}%"))
+        self._orig_vol_spin = QSpinBox()
+        self._orig_vol_spin.setRange(0, 200)
+        self._orig_vol_spin.setValue(100)
+        self._orig_vol_spin.setSuffix("%")
+        self._orig_vol_spin.setFixedWidth(64)
+        self._orig_vol_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self._orig_vol_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._orig_vol_spin.setStyleSheet(vol_spin_style)
+        self._orig_vol_spin.setToolTip("Type the exact original volume in percent (0-200%).")
+        self._orig_vol.valueChanged.connect(self._orig_vol_spin.setValue)
+        self._orig_vol_spin.valueChanged.connect(self._orig_vol.setValue)
         self._orig_vol.setToolTip(
             "Volume of the original video audio track (music, effects, original dialogue).\n"
             "Lower this so the lektor is clearly audible over the background.\n"
@@ -4288,7 +5700,7 @@ class SrtTab(BaseTab):
         )
         row.addWidget(lbl)
         row.addWidget(self._orig_vol)
-        row.addWidget(self._orig_vol_lbl)
+        row.addWidget(self._orig_vol_spin)
         row.addStretch()
         lay.addLayout(row)
 
@@ -4304,7 +5716,13 @@ class SrtTab(BaseTab):
         self._atempo_widget = QWidget()
         self._atempo_widget.setObjectName("atempoWrap")
         self._atempo_widget.setStyleSheet("QWidget#atempoWrap { background: transparent; }")
-        atempo_row = QHBoxLayout(self._atempo_widget)
+        atempo_outer = QVBoxLayout(self._atempo_widget)
+        atempo_outer.setContentsMargins(0, 0, 0, 0)
+        atempo_outer.setSpacing(4)
+
+        atempo_row_wrap = QWidget()
+        atempo_row_wrap.setStyleSheet("background: transparent;")
+        atempo_row = QHBoxLayout(atempo_row_wrap)
         atempo_row.setContentsMargins(20, 0, 0, 0)
         atempo_row.setSpacing(8)
         atempo_lbl = QLabel("Atempo threshold (ms):")
@@ -4324,6 +5742,25 @@ class SrtTab(BaseTab):
         atempo_row.addWidget(atempo_lbl)
         atempo_row.addWidget(self._atempo_threshold)
         atempo_row.addStretch()
+        atempo_outer.addWidget(atempo_row_wrap)
+
+        halve_row_wrap = QWidget()
+        halve_row_wrap.setStyleSheet("background: transparent;")
+        halve_row = QHBoxLayout(halve_row_wrap)
+        halve_row.setContentsMargins(20, 0, 0, 0)
+        halve_row.setSpacing(8)
+        self._atempo_halve_check = QCheckBox("Halve overshoot above threshold")
+        self._atempo_halve_check.setToolTip(
+            "Fragments that exceed their slot by MORE than the threshold are sped up\n"
+            "so that the remaining overshoot is half of the original one.\n"
+            "Example: +0.8s becomes +0.4s, +1.0s becomes +0.5s.\n"
+            "Fragments within the threshold are still fitted fully into their slot.\n"
+            "Speed-up is limited to 4x."
+        )
+        halve_row.addWidget(self._atempo_halve_check)
+        halve_row.addStretch()
+        atempo_outer.addWidget(halve_row_wrap)
+
         lay.addWidget(self._atempo_widget)
         self._atempo_widget.setVisible(False)
 
@@ -4429,12 +5866,66 @@ class SrtTab(BaseTab):
             return
         if is_playing:
             self._media_player.play()
+            QTimer.singleShot(150, self._resync_dub_player)
         else:
             self._media_player.pause()
             if getattr(self, '_dub_player', None):
                 self._dub_player.pause()
+            self._pause_extra_dub_players()
+
+    def _resync_dub_player(self):
+        if not getattr(self, '_dub_player', None):
+            return
+        if self._dub_sync_held():
+            return
+        if not getattr(self, '_sim_dub_check', None) or not self._sim_dub_check.isChecked():
+            return
+        player = self.main._video_player
+        if not player.has_media() or not player.is_playing():
+            return
+
+        pos_ms = player.position_seconds() * 1000.0
+        schedule = self._build_dub_schedule()
+        self._update_extra_dub_lanes(schedule, pos_ms, True, True)
+
+        entry = None
+        for candidate in schedule:
+            if candidate['start_ms'] > pos_ms:
+                break
+            if candidate.get('lane', 0) != 0:
+                continue
+            if candidate['start_ms'] <= pos_ms < candidate['end_ms']:
+                entry = candidate
+                break
+        if entry is None:
+            return
+
+        url = QUrl.fromLocalFile(entry['output_path'])
+        offset_ms = int((pos_ms - entry['start_ms']) * entry['rate'])
+
+        if (
+            getattr(self, '_current_sim_frag_idx', None) != entry['index']
+            or self._dub_player.source() != url
+        ):
+            self._current_sim_frag_idx = entry['index']
+            self._dub_player.setSource(url)
+            self._dub_player.setPlaybackRate(entry['rate'])
+            self._dub_player.setPosition(offset_ms)
+            self._dub_player.play()
+            return
+
+        state = self._dub_player.playbackState()
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            return
+        if self._dub_player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
+            return
+        if state == QMediaPlayer.PlaybackState.StoppedState:
+            self._dub_player.setPosition(offset_ms)
+        self._dub_player.setPlaybackRate(entry['rate'])
+        self._dub_player.play()
 
     def _sync_video_position(self, pos_s: float):
+        self._update_playing_highlight(int(pos_s * 1000))
         if not getattr(self, '_media_player', None):
             return
         target_ms = int(pos_s * 1000)
@@ -4445,6 +5936,8 @@ class SrtTab(BaseTab):
         offset_ms = self._offset_spin.value() if getattr(self, '_offset_spin', None) else 0
         autofit = bool(getattr(self, '_autofit_check', None) and self._autofit_check.isChecked())
         atempo_thresh = self._atempo_threshold.value() if getattr(self, '_atempo_threshold', None) else 300
+        halve = bool(getattr(self, '_atempo_halve_check', None) and self._atempo_halve_check.isChecked())
+        overlap_mode = self._get_overlap_mode()
 
         done_frags = [
             f for f in self._fragments
@@ -4455,9 +5948,10 @@ class SrtTab(BaseTab):
         done_frags.sort(key=lambda f: f.get('start_ms', 0) or 0)
 
         sig = (
-            offset_ms, autofit, atempo_thresh,
+            offset_ms, autofit, atempo_thresh, halve, overlap_mode,
             tuple(
-                (f['index'], f['output_path'], f.get('start_ms', 0), f.get('end_ms', 0))
+                (f['index'], f['output_path'], f.get('start_ms', 0), f.get('end_ms', 0),
+                 str(f.get('speaker') or '').strip())
                 for f in done_frags
             ),
         )
@@ -4465,7 +5959,7 @@ class SrtTab(BaseTab):
             return getattr(self, '_dub_schedule', [])
 
         schedule: List[Dict] = []
-        cursor_ms = 0.0
+        cursors: Dict[str, float] = {}
         for frag in done_frags:
             if not os.path.exists(frag['output_path']):
                 continue
@@ -4481,13 +5975,15 @@ class SrtTab(BaseTab):
             rate = 1.0
             played_ms = audio_dur_ms
 
-            if slot_ms > 0 and audio_dur_ms > slot_ms:
-                overshoot_ms = audio_dur_ms - slot_ms
-                if autofit and overshoot_ms <= atempo_thresh:
-                    rate = min(audio_dur_ms / slot_ms, 4.0)
-                    played_ms = slot_ms
+            if autofit:
+                target_ms = self._atempo_target_ms(slot_ms, audio_dur_ms)
+                if target_ms is not None and target_ms > 0:
+                    rate = min(audio_dur_ms / target_ms, 4.0)
+                    played_ms = audio_dur_ms / rate
 
-            start_ms = max(adj_start, cursor_ms)
+            start_ms = self._fragment_start_with_overlap(
+                overlap_mode, frag.get('speaker'), adj_start, cursors
+            )
             end_ms = start_ms + played_ms
 
             schedule.append({
@@ -4496,17 +5992,38 @@ class SrtTab(BaseTab):
                 'start_ms': start_ms,
                 'end_ms': end_ms,
                 'rate': rate,
+                'lane': 0,
             })
-            cursor_ms = end_ms
+            self._advance_overlap_cursor(overlap_mode, frag.get('speaker'), end_ms, cursors)
+
+        schedule.sort(key=lambda e: e['start_ms'])
+        lane_ends: List[float] = []
+        for entry in schedule:
+            for lane, lane_end in enumerate(lane_ends):
+                if lane_end <= entry['start_ms']:
+                    entry['lane'] = lane
+                    lane_ends[lane] = entry['end_ms']
+                    break
+            else:
+                entry['lane'] = len(lane_ends)
+                lane_ends.append(entry['end_ms'])
 
         self._dub_schedule = schedule
         self._dub_schedule_sig = sig
         return schedule
 
     def _on_video_position_changed(self, pos_ms: int):
+        if self._dub_sync_held():
+            return
+
+        if not self.main._video_player.has_media():
+            self._stop_extra_dub_players()
+            return
+
         if not getattr(self, '_sim_dub_check', None) or not self._sim_dub_check.isChecked():
             if getattr(self, '_dub_player', None) and self._dub_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
                 self._dub_player.stop()
+            self._stop_extra_dub_players()
             self._current_sim_frag_idx = None
             self._last_sim_pos_ms = None
             return
@@ -4521,14 +6038,13 @@ class SrtTab(BaseTab):
         for entry in schedule:
             if entry['start_ms'] > pos_ms:
                 break
+            if entry.get('lane', 0) != 0:
+                continue
             if entry['start_ms'] <= pos_ms < entry['end_ms']:
                 matching_entry = entry
                 break
 
-        is_video_playing = (
-            self._media_player.playbackState()
-            == QMediaPlayer.PlaybackState.PlayingState
-        )
+        is_video_playing = self.main._video_player.is_playing()
 
         if matching_entry:
             frag_idx = matching_entry['index']
@@ -4575,6 +6091,92 @@ class SrtTab(BaseTab):
                 self._dub_player.stop()
                 self._current_sim_frag_idx = None
 
+        self._update_extra_dub_lanes(schedule, pos_ms, is_seek, is_video_playing)
+
+    def _get_extra_dub_player(self, lane: int) -> QMediaPlayer:
+        if getattr(self, '_extra_dub_players', None) is None:
+            self._extra_dub_players = {}
+        pair = self._extra_dub_players.get(lane)
+        if pair is None:
+            player = QMediaPlayer()
+            output = QAudioOutput()
+            player.setAudioOutput(output)
+            base_output = getattr(self, '_dub_audio_output', None)
+            output.setVolume(base_output.volume() if base_output is not None else 1.0)
+            pair = (player, output)
+            self._extra_dub_players[lane] = pair
+        return pair[0]
+
+    def _pause_extra_dub_players(self) -> None:
+        for player, _output in (getattr(self, '_extra_dub_players', None) or {}).values():
+            player.pause()
+
+    def _stop_extra_dub_players(self) -> None:
+        for player, _output in (getattr(self, '_extra_dub_players', None) or {}).values():
+            player.stop()
+        state = getattr(self, '_extra_sim_idx', None)
+        if state:
+            state.clear()
+
+    def _update_extra_dub_lanes(self, schedule: List[Dict], pos_ms: float,
+                                is_seek: bool, is_video_playing: bool) -> None:
+        if getattr(self, '_extra_dub_players', None) is None:
+            self._extra_dub_players = {}
+        if getattr(self, '_extra_sim_idx', None) is None:
+            self._extra_sim_idx = {}
+        state = self._extra_sim_idx
+
+        lanes = {e.get('lane', 0) for e in schedule if e.get('lane', 0) > 0}
+        for lane in sorted(lanes | set(self._extra_dub_players.keys())):
+            match = None
+            for entry in schedule:
+                if entry['start_ms'] > pos_ms:
+                    break
+                if entry.get('lane', 0) != lane:
+                    continue
+                if entry['start_ms'] <= pos_ms < entry['end_ms']:
+                    match = entry
+                    break
+
+            if match is None:
+                if state.get(lane) is not None:
+                    pair = self._extra_dub_players.get(lane)
+                    if pair is not None:
+                        pair[0].stop()
+                    state[lane] = None
+                continue
+
+            player = self._get_extra_dub_player(lane)
+            frag_idx = match['index']
+            offset_ms = int((pos_ms - match['start_ms']) * match['rate'])
+
+            if state.get(lane) != frag_idx:
+                state[lane] = frag_idx
+                player.setSource(QUrl.fromLocalFile(match['output_path']))
+                player.setPlaybackRate(match['rate'])
+                player.setPosition(offset_ms)
+                if is_video_playing:
+                    player.play()
+            elif is_seek:
+                player.setPlaybackRate(match['rate'])
+                player.setPosition(offset_ms)
+                if is_video_playing:
+                    player.play()
+            else:
+                if player.playbackRate() != match['rate']:
+                    player.setPlaybackRate(match['rate'])
+                if (
+                    is_video_playing
+                    and player.playbackState() != QMediaPlayer.PlaybackState.PlayingState
+                ):
+                    if player.mediaStatus() != QMediaPlayer.MediaStatus.EndOfMedia:
+                        player.play()
+                elif (
+                    not is_video_playing
+                    and player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+                ):
+                    player.pause()
+
     def build_video_preview_section(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -4591,6 +6193,19 @@ class SrtTab(BaseTab):
         self._sim_dub_check.setStyleSheet(f"color:{C['text2']};font-size:11px;")
         preview_top_lay.addWidget(self._sim_dub_check)
         preview_top_lay.addStretch()
+
+        self._fs_btn = QPushButton("⛶  Fullscreen")
+        self._fs_btn.setFixedHeight(24)
+        self._fs_btn.setStyleSheet("font-size:11px;padding:2px 8px;")
+        self._fs_btn.setToolTip(
+            "Open the video in fullscreen (or double-click the video).\n"
+            "Space: play/pause\n"
+            "Left/Right: seek 5 s (Shift: 1 s)\n"
+            "Up/Down: volume\n"
+            "F / Esc: exit fullscreen"
+        )
+        self._fs_btn.clicked.connect(self._enter_video_fullscreen)
+        preview_top_lay.addWidget(self._fs_btn)
 
         self._dub_vol_widget = QWidget()
         self._dub_vol_widget.setObjectName("dubVolWrap")
@@ -4620,7 +6235,8 @@ class SrtTab(BaseTab):
 
         self._sim_dub_check.toggled.connect(self._dub_vol_widget.setVisible)
 
-        self._video_widget = QVideoWidget()
+        self._video_widget = ClickableVideoWidget()
+        self._video_widget.double_clicked.connect(self._enter_video_fullscreen)
         self._video_widget.setMinimumHeight(200)
         self._video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._media_player.setVideoOutput(self._video_widget)
@@ -4637,10 +6253,163 @@ class SrtTab(BaseTab):
         w.setVisible(False)
         return w
 
+    def _find_fragment_at(self, pos_ms: int) -> Optional[int]:
+        sim_on = bool(getattr(self, '_sim_dub_check', None) and self._sim_dub_check.isChecked())
+        if sim_on:
+            for entry in self._build_dub_schedule():
+                if entry['start_ms'] > pos_ms:
+                    break
+                if pos_ms < entry['end_ms']:
+                    return entry['index']
+        for frag in self._fragments:
+            start = frag.get('start_ms')
+            end = frag.get('end_ms')
+            if start is None or end is None:
+                continue
+            if start <= pos_ms < end:
+                return frag['index']
+        return None
+
+    def _fragment_caption(self, idx: int) -> str:
+        frag = next((f for f in self._fragments if f.get('index') == idx), None)
+        if not frag:
+            return ""
+        text = " ".join((frag.get('text') or '').split())
+        if len(text) > 90:
+            text = text[:87].rstrip() + "…"
+        return f"#{idx + 1}  {text}"
+
+    def _set_playing_highlight(self, idx: int, scroll: bool = True):
+        item = self._frag_items.get(idx)
+        if item is None:
+            return
+        prev = getattr(self, '_hl_item', None)
+        if prev is item:
+            return
+        color = QColor(C["accent"])
+        color.setAlpha(80)
+        brush = QBrush(color)
+        cols = range(self._tree.columnCount())
+        self._tree.blockSignals(True)
+        try:
+            if prev is not None:
+                try:
+                    for col in cols:
+                        prev.setBackground(col, QBrush())
+                except RuntimeError:
+                    pass
+            for col in cols:
+                item.setBackground(col, brush)
+        finally:
+            self._tree.blockSignals(False)
+        self._hl_item = item
+        if scroll:
+            self._tree.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
+
+    def _update_playing_highlight(self, pos_ms: int):
+        if not self._fragments or not self._frag_items:
+            return
+        try:
+            idx = self._find_fragment_at(pos_ms)
+            if idx is None:
+                return
+            self._set_playing_highlight(
+                idx, scroll=not getattr(self, '_suppress_scroll', False)
+            )
+            self._fs_update_fragment(idx)
+
+            click_pos = getattr(self, '_click_pos_ms', None)
+            if click_pos is not None and abs(pos_ms - click_pos) < 300:
+                return
+
+            if getattr(self, '_last_preview_idx', None) != idx:
+                self._last_preview_idx = idx
+                frag = next((f for f in self._fragments if f['index'] == idx), None)
+                if frag and self._preview_text is not None:
+                    self._preview_text.setPlainText(frag.get('text', ''))
+        except Exception as e:
+            logger.warning(f"Playing highlight failed: {e}")
+
+    def _fs_update_fragment(self, idx: int):
+        win = getattr(self, '_fs_window', None)
+        if win is None or getattr(self, '_fs_frag_idx', None) == idx:
+            return
+        self._fs_frag_idx = idx
+        win.set_fragment(self._fragment_caption(idx))
+
+    def _refresh_video_frame(self):
+        def _nudge():
+            if self._media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                self._media_player.setPosition(self._media_player.position())
+        QTimer.singleShot(150, _nudge)
+
+    def _enter_video_fullscreen(self):
+        if getattr(self, '_fs_window', None) is not None:
+            return
+        if not self._video_loaded or self._video_widget is None:
+            return
+        player = self.main._video_player
+        if not player.has_media():
+            self.main._set_status("Video audio is still loading — try again in a moment", C["warning"])
+            return
+
+        win = VideoFullscreenWindow(self.main)
+        win.toggle_play_requested.connect(player.toggle_play)
+        win.stop_requested.connect(player.stop_playback)
+        win.seek_requested.connect(player.seek_seconds)
+        win.seek_relative_requested.connect(player.seek_relative)
+        win.volume_changed.connect(player.set_volume)
+        win.closed.connect(self._exit_video_fullscreen)
+        player.position_updated.connect(self._on_fs_position)
+        player.playback_state_changed.connect(self._on_fs_playing)
+
+        self._fs_window = win
+        self._fs_frag_idx = None
+        win.set_volume(player.get_volume())
+        win.set_playing(player.is_playing())
+        win.set_position(player.position_seconds(), player.duration_seconds())
+
+        self._media_player.setVideoOutput(win.video_widget)
+        win.enter(self.main.screen())
+        self._refresh_video_frame()
+        self._update_playing_highlight(int(player.position_seconds() * 1000))
+
+    def _exit_video_fullscreen(self):
+        win = getattr(self, '_fs_window', None)
+        if win is None:
+            return
+        self._fs_window = None
+        self._fs_frag_idx = None
+        player = self.main._video_player
+        for sig, slot in (
+            (player.position_updated, self._on_fs_position),
+            (player.playback_state_changed, self._on_fs_playing),
+        ):
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._media_player.setVideoOutput(self._video_widget)
+        win.deleteLater()
+        self._refresh_video_frame()
+
+    def _on_fs_position(self, pos_s: float):
+        win = getattr(self, '_fs_window', None)
+        if win is not None:
+            win.set_position(pos_s, self.main._video_player.duration_seconds())
+
+    def _on_fs_playing(self, playing: bool):
+        win = getattr(self, '_fs_window', None)
+        if win is not None:
+            win.set_playing(playing)
+
     def _on_dub_vol_changed(self, value: int):
         self._dub_vol_lbl.setText(f"{value}%")
+        volume = value / 100.0
         if getattr(self, '_dub_audio_output', None):
-            self._dub_audio_output.setVolume(value / 100.0)
+            self._dub_audio_output.setVolume(volume)
+        for _player, output in (getattr(self, '_extra_dub_players', None) or {}).values():
+            output.setVolume(volume)
 
     def _update_video_preview_visibility(self):
         if getattr(self, '_video_preview_widget', None) is not None:
