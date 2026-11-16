@@ -3,6 +3,7 @@
 Ebook tab implementation – EPUB, PDF, TXT, Kindle, FB2 loading,
 fragment management, synthesis, audiobook export and preview.
 """
+import copy
 import os
 import json
 import time
@@ -14,7 +15,7 @@ import logging
 import shutil
 import traceback
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Set
 
 import numpy as np
 import soundfile as sf
@@ -41,6 +42,8 @@ from config import (
 from widgets import FragmentTreeWidget
 from utils import _get_last_dir, _set_last_dir, _fmt, _fmt_ms, _get_wav_duration, _open_file, _ref_audio_hash
 from workers import TTSWorker
+from session_manager import choose_session_file
+from undo_manager import snapshot_fragments, restore_snapshot_files, move_to_trash
 
 # Lokalne importy (pozostawione bez zmian)
 from input_formats import get_format
@@ -96,13 +99,14 @@ class EbookTab(BaseTab):
         self._build_ui()
 
     def set_shared_widgets(self, btn_start, btn_stop, synth_progress, eta_label, progress, norm_check):
-        """Sets shared widgets from MainWindow."""
+        """Set widgets shared with MainWindow."""
         self._btn_start = btn_start
         self._btn_stop = btn_stop
         self._synth_progress = synth_progress
         self._eta_label = eta_label
         self._progress = progress
         self._norm_check = norm_check
+        self._ebook_tree.itemChanged.connect(self._on_item_check_changed)
 
     def get_widget(self) -> QWidget:
         """Return the built tab widget."""
@@ -320,29 +324,26 @@ class EbookTab(BaseTab):
             QMessageBox.critical(self.main, "Load error", str(e))
             return
 
+        self.main.undo_manager.clear()
+
         self._epub_path = path
-        self._ebook_output_dir = str(OUTPUTS_DIR / Path(path).stem)
+        self._ebook_output_dir = str(self._session_dirs(path)[1])
         if self._audiobook_output_edit is not None:
             self._audiobook_output_edit.setText(self._ebook_output_dir)
 
-        auto = self._auto_ebook_session_path()
-        if auto and auto.exists():
-            reply = QMessageBox.question(
-                self.main, "Restore previous session",
-                f"A saved session was found for this file.\n\n"
-                f"Restore it? Previously synthesized fragments will be loaded automatically.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                try:
-                    with open(str(auto), "r", encoding="utf-8") as fh:
-                        data = json.load(fh)
-                    self._restore_ebook_session_data(data)
-                    logger.info(f"Auto ebook session restored from: {auto}")
-                    return
-                except Exception as e:
-                    logger.warning(f"Auto ebook session restore failed: {e}")
-                    self.main._set_status("Could not restore previous session — starting fresh.", C["warning"])
+        chosen = choose_session_file(
+            self.main, [self._auto_ebook_session_path(), self._user_ebook_session_path()]
+        )
+        if chosen:
+            try:
+                with open(str(chosen), "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                self._restore_ebook_session_data(data)
+                logger.info(f"Ebook session restored from: {chosen}")
+                return
+            except Exception as e:
+                logger.warning(f"Ebook session restore failed: {e}")
+                self.main._set_status("Could not restore previous session — starting fresh.", C["warning"])
 
         fname = Path(path).name
         self._epub_label.setText(
@@ -370,6 +371,7 @@ class EbookTab(BaseTab):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        self.main.undo_manager.clear()
         self._ebook_fragments.clear()
         self._ebook_frag_items.clear()
         self._ebook_chapter_item = None
@@ -415,6 +417,10 @@ class EbookTab(BaseTab):
             ch_item.setExpanded(True)
         finally:
             self._ebook_tree.setUpdatesEnabled(True)
+
+        if self._ebook_filter_edit is not None:
+            self._apply_ebook_filter(self._ebook_filter_edit.text())
+        self._update_preview_btn_state()
 
     def _create_ebook_tree_item(self, frag: Dict, parent=None) -> QTreeWidgetItem:
         status = frag.get('status', 'waiting')
@@ -520,31 +526,76 @@ class EbookTab(BaseTab):
     # Fragment Selection / Filtering
     # ------------------------------------------------------------------
 
+    def _on_item_check_changed(self, item, column):
+        if column != COL_STATUS:
+            return
+        idx = item.data(COL_STATUS, Qt.ItemDataRole.UserRole)
+        if idx is None:
+            return
+        if 0 <= idx < len(self._ebook_fragments) and self._ebook_fragments[idx].get('index') == idx:
+            frag = self._ebook_fragments[idx]
+        else:
+            frag = next((f for f in self._ebook_fragments if f['index'] == idx), None)
+        if frag is not None:
+            frag['_checked'] = item.checkState(COL_STATUS) == Qt.CheckState.Checked
+
+    def _sync_checks_from_tree(self):
+        if not self._ebook_chapter_item:
+            return
+        frag_map = {f['index']: f for f in self._ebook_fragments}
+        for i in range(self._ebook_chapter_item.childCount()):
+            child = self._ebook_chapter_item.child(i)
+            idx = child.data(COL_STATUS, Qt.ItemDataRole.UserRole)
+            frag = frag_map.get(idx)
+            if frag is not None:
+                frag['_checked'] = child.checkState(COL_STATUS) == Qt.CheckState.Checked
+
     def _apply_ebook_filter(self, text: str):
         if not self._ebook_chapter_item:
             return
-        txt = text.lower().strip()
-        for i in range(self._ebook_chapter_item.childCount()):
-            child = self._ebook_chapter_item.child(i)
-            matches = (not txt or
-                       txt in child.text(COL_FRAGMENT).lower() or
-                       txt in child.text(COL_SPEAKER).lower())
-            child.setHidden(not matches)
+        txt = " ".join(text.lower().split())
+        frag_map = {f['index']: f for f in self._ebook_fragments}
+        self._ebook_tree.setUpdatesEnabled(False)
+        try:
+            for i in range(self._ebook_chapter_item.childCount()):
+                child = self._ebook_chapter_item.child(i)
+                if not txt:
+                    child.setHidden(False)
+                    continue
+                idx = child.data(COL_STATUS, Qt.ItemDataRole.UserRole)
+                frag = frag_map.get(idx)
+                if frag is None:
+                    child.setHidden(True)
+                    continue
+                haystack = " ".join(
+                    p for p in (
+                        (frag.get('text') or '').strip(),
+                        (frag.get('speaker') or '').strip(),
+                    ) if p
+                ).lower()
+                haystack = " ".join(haystack.split())
+                child.setHidden(txt not in haystack)
+        finally:
+            self._ebook_tree.setUpdatesEnabled(True)
+        self._update_preview_btn_state()
 
     def _select_all_ebook(self, state: bool):
         if not self._ebook_chapter_item:
             return
-        cs = Qt.CheckState.Checked if state else Qt.CheckState.Unchecked
         self._ebook_tree.setUpdatesEnabled(False)
         self._ebook_tree.blockSignals(True)
         try:
             for i in range(self._ebook_chapter_item.childCount()):
                 child = self._ebook_chapter_item.child(i)
-                if not child.isHidden():
-                    child.setCheckState(COL_STATUS, cs)
+                checked = state and not child.isHidden()
+                child.setCheckState(
+                    COL_STATUS,
+                    Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked,
+                )
         finally:
             self._ebook_tree.blockSignals(False)
             self._ebook_tree.setUpdatesEnabled(True)
+        self._sync_checks_from_tree()
         self._update_preview_btn_state()
 
     def _select_failed_ebook(self):
@@ -585,25 +636,26 @@ class EbookTab(BaseTab):
         try:
             for i in range(self._ebook_chapter_item.childCount()):
                 child = self._ebook_chapter_item.child(i)
-                if child.isHidden():
-                    continue
-                idx = child.data(COL_STATUS, Qt.ItemDataRole.UserRole)
-                frag = frag_map.get(idx)
-                if not frag:
-                    continue
-                status = frag.get('status', 'waiting')
-                if want_failed and want_pending:
-                    match = status in ('error', 'waiting')
-                elif want_failed:
-                    match = status == 'error'
-                elif want_pending:
-                    match = status == 'waiting'
-                else:
-                    match = False
-                child.setCheckState(COL_STATUS, Qt.CheckState.Checked if match else Qt.CheckState.Unchecked)
+                match = False
+                if not child.isHidden():
+                    idx = child.data(COL_STATUS, Qt.ItemDataRole.UserRole)
+                    frag = frag_map.get(idx)
+                    if frag is not None:
+                        status = frag.get('status', 'waiting')
+                        if want_failed and want_pending:
+                            match = status in ('error', 'waiting')
+                        elif want_failed:
+                            match = status == 'error'
+                        elif want_pending:
+                            match = status == 'waiting'
+                child.setCheckState(
+                    COL_STATUS,
+                    Qt.CheckState.Checked if match else Qt.CheckState.Unchecked,
+                )
         finally:
             self._ebook_tree.blockSignals(False)
             self._ebook_tree.setUpdatesEnabled(True)
+        self._sync_checks_from_tree()
         self._update_preview_btn_state()
 
     def _on_ebook_selection_changed(self):
@@ -970,6 +1022,44 @@ class EbookTab(BaseTab):
     # Fragment Editing
     # ------------------------------------------------------------------
 
+    def _undo_begin(self, with_files: bool = False) -> Optional[Dict]:
+        try:
+            return snapshot_fragments(self._ebook_fragments, with_files)
+        except Exception as e:
+            logger.warning(f"Undo snapshot failed: {e}")
+            self.main.undo_manager.clear()
+            return None
+
+    def _undo_commit(self, label: str, before: Optional[Dict]):
+        if before is not None:
+            self.main.undo_manager.push('ebook', label, before)
+
+    def _undo_capture(self, with_files: bool = False) -> Dict:
+        return snapshot_fragments(self._ebook_fragments, with_files)
+
+    def _undo_restore(self, state: Dict) -> int:
+        missing = restore_snapshot_files(state, self._ebook_fragments, self._file_watcher)
+        missing_set = set(missing)
+        fragments = copy.deepcopy(state['fragments'])
+        for f in fragments:
+            if f.get('output_path') in missing_set:
+                f['status'] = 'waiting'
+                f['output_path'] = None
+        self._ebook_fragments = fragments
+        if state.get('files') is not None:
+            self.main._current_fragment_idx = None
+            self.main._audio_data = None
+            if hasattr(self.main, '_wave_out'):
+                self.main._wave_out.clear()
+            self.main._play_btn.setEnabled(False)
+            self.main._stop_btn.setEnabled(False)
+            self.main._time_lbl.setText("0:00 / 0:00")
+        self._populate_ebook_tree()
+        self._sync_ebook_speaker_ui()
+        self.main._update_action_buttons()
+        self._update_preview_btn_state()
+        return len(missing)
+
     def _edit_ebook_fragment_text(self, frag: Dict):
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Edit fragment #{frag['index'] + 1}")
@@ -1004,11 +1094,13 @@ class EbookTab(BaseTab):
         if not new_text or new_text == frag.get('text', ''):
             return
 
+        before = self._undo_begin()
         frag['text'] = new_text
         frag['status'] = 'waiting'
         frag['error_msg'] = None
         self._update_ebook_tree_item(frag['index'])
         self._ebook_preview_text.setPlainText(new_text)
+        self._undo_commit(f"text edit of fragment #{frag['index'] + 1}", before)
         self.main._set_status(f"Fragment #{frag['index'] + 1} text updated — status reset to waiting.")
         
     def _prompt_ebook_speaker_name(self, title: str, message: str, current: str) -> Tuple[Optional[str], bool]:
@@ -1068,9 +1160,11 @@ class EbookTab(BaseTab):
 
     def _edit_ebook_speaker(self, frag: Dict, clear: bool = False):
         if clear:
+            before = self._undo_begin()
             frag['speaker'] = None
             self._update_ebook_tree_item(frag['index'])
             self._sync_ebook_speaker_ui()
+            self._undo_commit(f"speaker removal on fragment #{frag['index'] + 1}", before)
             return
 
         current = frag.get('speaker') or ""
@@ -1080,9 +1174,11 @@ class EbookTab(BaseTab):
             current,
         )
         if ok:
+            before = self._undo_begin()
             frag['speaker'] = name.strip() or None
             self._update_ebook_tree_item(frag['index'])
             self._sync_ebook_speaker_ui()
+            self._undo_commit(f"speaker change on fragment #{frag['index'] + 1}", before)
 
     def _set_speaker_for_selected_ebook(self):
         if not self._ebook_fragments or not self._ebook_chapter_item:
@@ -1116,11 +1212,13 @@ class EbookTab(BaseTab):
             return
 
         new_speaker = name.strip() or None
+        before = self._undo_begin()
         for frag in checked_frags:
             frag['speaker'] = new_speaker
             self._update_ebook_tree_item(frag['index'])
 
         self._sync_ebook_speaker_ui()
+        self._undo_commit(f"speaker change on {len(checked_frags)} fragment(s)", before)
         self.main._set_status(
             f"Speaker {'set to ' + new_speaker if new_speaker else 'cleared'} "
             f"for {len(checked_frags)} fragment(s).",
@@ -1225,6 +1323,8 @@ class EbookTab(BaseTab):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
+        before = self._undo_begin()
+
         pre_ms = pre_spin.value()
         if pre_ms <= 0:
             frag.pop('pre_silence_ms', None)
@@ -1238,6 +1338,7 @@ class EbookTab(BaseTab):
             frag['target_duration_ms'] = audio_dur_ms + extra_ms
 
         self._update_ebook_tree_item(frag['index'])
+        self._undo_commit(f"duration change of fragment #{frag['index'] + 1}", before)
         self.main._set_status(
             f"Fragment #{frag['index'] + 1} — audio: {_fmt_ms(audio_dur_ms)}, "
             f"silence before: {pre_ms} ms, silence after: {extra_ms} ms.",
@@ -1309,8 +1410,8 @@ class EbookTab(BaseTab):
                 sv["player"].load(path)
                 sv["proc_btn"].setEnabled(True)
                 sv["tr_btn"].setEnabled(
-                    self.whisper is not None
-                    and self.whisper.is_downloaded(self.main._w_size.currentData())
+                    self.main._whisper_backend is not None
+                    and self.main._whisper_backend.is_downloaded(self.main._w_size.currentData())
                 )
 
         for spk, text in saved_texts.items():
@@ -1370,6 +1471,8 @@ class EbookTab(BaseTab):
         if pos < 0:
             return
 
+        before = self._undo_begin(True)
+
         new_frag = {
             'index': 0,
             'text': new_text,
@@ -1386,6 +1489,7 @@ class EbookTab(BaseTab):
         self._rename_ebook_outputs_to_match_order()
         self._populate_ebook_tree()
         self.main._update_action_buttons()
+        self._undo_commit("adding a fragment", before)
 
         new_item = self._ebook_frag_items.get(pos + 1)
         if new_item:
@@ -1443,6 +1547,8 @@ class EbookTab(BaseTab):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
+        before = self._undo_begin(True)
+
         if result["action"] == "all":
             removed_fragments = [f for f in self._ebook_fragments if f['index'] in checked_indices]
             self._ebook_fragments = [f for f in self._ebook_fragments if f['index'] not in checked_indices]
@@ -1450,14 +1556,37 @@ class EbookTab(BaseTab):
             removed_fragments = [f for f in self._ebook_fragments if f['index'] == frag['index']]
             self._ebook_fragments = [f for f in self._ebook_fragments if f['index'] != frag['index']]
 
+        try:
+            srt_tab = getattr(self.main, 'srt_tab', None)
+            if srt_tab is not None and hasattr(srt_tab, '_release_audio_file_locks'):
+                srt_tab._release_audio_file_locks()
+        except Exception:
+            pass
+
+        try:
+            self.main._stop_play()
+        except Exception:
+            pass
+        QApplication.processEvents()
+
         for f in removed_fragments:
             p = f.get('output_path', '')
-            if p and os.path.exists(p):
+            if not p or not os.path.exists(p):
+                continue
+            try:
                 self._file_watcher.removePath(p)
-                try:
-                    os.remove(p)
-                except Exception as e:
-                    logger.warning(f"Could not delete orphan audio {p}: {e}")
+            except Exception:
+                pass
+            try:
+                dst = move_to_trash(p)
+                logger.info(f"Moved removed audio to trash: {dst}")
+            except Exception as e:
+                logger.error(f"Cannot move {p} to trash: {e}")
+                self.main._set_status(
+                    f"Could not move file to trash: {Path(p).name} "
+                    f"(close any player or Explorer window and retry)",
+                    C["warning"],
+                )
 
         for i, f in enumerate(self._ebook_fragments):
             f['index'] = i
@@ -1465,62 +1594,246 @@ class EbookTab(BaseTab):
         self._rename_ebook_outputs_to_match_order()
         self._populate_ebook_tree()
         self.main._update_action_buttons()
+        self._update_preview_btn_state()
+        self._undo_commit(f"removal of {len(removed_fragments)} fragment(s)", before)
         self.main._set_status(f"Fragment(s) removed. {len(self._ebook_fragments)} fragments remaining.")
 
     def _rename_ebook_outputs_to_match_order(self):
         if not self._ebook_output_dir:
             return
-        prefix = Path(self._epub_path).stem if self._epub_path else "ebook_fragment"
 
-        to_rename = [
-            frag for frag in self._ebook_fragments
-            if frag.get('output_path') and os.path.exists(frag['output_path'])
-        ]
-        if not to_rename:
-            return
+        try:
+            srt_tab = getattr(self.main, 'srt_tab', None)
+            if srt_tab is not None and hasattr(srt_tab, '_release_audio_file_locks'):
+                srt_tab._release_audio_file_locks()
+        except Exception:
+            pass
+        QApplication.processEvents()
 
-        desired = {
-            frag['index']: os.path.join(
-                self._ebook_output_dir, f"{prefix}_{frag['index'] + 1:03d}.wav"
-            )
-            for frag in to_rename
-        }
+        try:
+            prefix = Path(self._epub_path).stem if self._epub_path else "ebook_fragment"
 
-        if all(frag['output_path'] == desired[frag['index']] for frag in to_rename):
-            return
+            def _norm(p: str) -> str:
+                return os.path.normcase(os.path.abspath(p))
 
-        for frag in to_rename:
-            self._file_watcher.removePath(frag['output_path'])
+            to_rename: List[Dict] = []
+            seen_paths = set()
+            for frag in self._ebook_fragments:
+                p = frag.get('output_path')
+                if not p or not os.path.exists(p):
+                    continue
+                key = _norm(p)
+                if key in seen_paths:
+                    continue
+                seen_paths.add(key)
+                to_rename.append(frag)
+            if not to_rename:
+                return
 
-        temp_map = {}
-        for frag in to_rename:
-            src = frag['output_path']
-            tmp = src + '.__reorder__'
-            try:
-                os.rename(src, tmp)
-                temp_map[frag['index']] = tmp
-            except Exception as e:
-                logger.warning(f"Reorder phase 1 failed for {src}: {e}")
-                temp_map[frag['index']] = src
+            desired = {
+                frag['index']: os.path.join(
+                    self._ebook_output_dir, f"{prefix}_{frag['index'] + 1:03d}.wav"
+                )
+                for frag in to_rename
+            }
 
-        for frag in to_rename:
-            tmp = temp_map[frag['index']]
-            dst = desired[frag['index']]
-            if tmp == frag['output_path']:
-                continue
-            try:
-                os.rename(tmp, dst)
-                frag['output_path'] = dst
-            except Exception as e:
-                logger.warning(f"Reorder phase 2 failed {tmp} -> {dst}: {e}")
+            if all(
+                _norm(frag['output_path']) == _norm(desired[frag['index']])
+                for frag in to_rename
+            ):
+                return
+
+            for frag in to_rename:
                 try:
-                    os.rename(tmp, frag['output_path'])
+                    self._file_watcher.removePath(frag['output_path'])
                 except Exception:
                     pass
 
-        for frag in to_rename:
-            if frag.get('output_path') and os.path.exists(frag['output_path']):
-                self._file_watcher.addPath(frag['output_path'])
+            def _safe_rename(src: str, dst: str, retries: int = 15, delay: float = 0.1) -> Tuple[bool, Optional[Exception]]:
+                last_exc: Optional[Exception] = None
+                for attempt in range(retries):
+                    if os.path.exists(dst):
+                        return False, FileExistsError(dst)
+                    try:
+                        os.rename(src, dst)
+                        return True, None
+                    except FileNotFoundError as e:
+                        return False, e
+                    except OSError as e:
+                        last_exc = e
+                        if attempt < retries - 1:
+                            QApplication.processEvents()
+                            time.sleep(delay)
+                return False, last_exc
+
+            owned = {
+                _norm(f['output_path']) for f in self._ebook_fragments if f.get('output_path')
+            }
+
+            def _temp_path(src: str) -> str:
+                if '.__reorder__' in os.path.basename(src):
+                    return src
+                root, ext = os.path.splitext(src)
+                candidate = f"{root}.__reorder__{ext}"
+                n = 1
+                while os.path.exists(candidate) or _norm(candidate) in owned:
+                    candidate = f"{root}.__reorder__{n}{ext}"
+                    n += 1
+                return candidate
+
+            def _owner_of(path: str, exclude_index: int) -> Optional[Dict]:
+                key = _norm(path)
+                for other in self._ebook_fragments:
+                    other_path = other.get('output_path')
+                    if other['index'] == exclude_index or not other_path:
+                        continue
+                    if _norm(other_path) == key:
+                        return other
+                return None
+
+            for frag in to_rename:
+                src = frag['output_path']
+                tmp = _temp_path(src)
+                if tmp == src:
+                    continue
+                ok, err = _safe_rename(src, tmp)
+                if ok:
+                    frag['output_path'] = tmp
+                    owned.add(_norm(tmp))
+                else:
+                    logger.warning(f"Reorder phase 1 failed for {src}: {err}")
+
+            backup_dir = os.path.join(self._ebook_output_dir, "__undo_backup")
+            ts = int(time.time() * 1000)
+            failed_count = 0
+            pending = list(to_rename)
+
+            while pending:
+                progress = False
+                next_pending: List[Dict] = []
+                for frag in pending:
+                    idx = frag['index']
+                    cur = frag['output_path']
+                    dst = desired[idx]
+
+                    if _norm(cur) == _norm(dst):
+                        frag['output_path'] = dst
+                        progress = True
+                        continue
+
+                    if os.path.exists(dst):
+                        if _owner_of(dst, idx) is not None:
+                            next_pending.append(frag)
+                            continue
+                        cleared = False
+                        try:
+                            os.remove(dst)
+                            cleared = True
+                            logger.info(f"Removed orphan reorder target: {dst}")
+                        except Exception as rm_err:
+                            logger.warning(f"Cannot remove orphan target {dst}: {rm_err}")
+                        if not cleared:
+                            try:
+                                os.makedirs(backup_dir, exist_ok=True)
+                                bdst = os.path.join(backup_dir, f"{ts}_{os.path.basename(dst)}")
+                                shutil.move(dst, bdst)
+                                cleared = True
+                                logger.info(f"Moved orphan target to backup: {bdst}")
+                            except Exception as mv_err:
+                                logger.error(f"Cannot move orphan target {dst}: {mv_err}")
+                        if not cleared:
+                            failed_count += 1
+                            continue
+
+                    ok, err = _safe_rename(cur, dst)
+                    if ok:
+                        frag['output_path'] = dst
+                        progress = True
+                    else:
+                        failed_count += 1
+                        logger.warning(
+                            f"Reorder phase 2 failed {cur} -> {dst}: {err}; "
+                            f"file kept at {cur}"
+                        )
+
+                if not next_pending:
+                    break
+                if not progress:
+                    failed_count += len(next_pending)
+                    for frag in next_pending:
+                        logger.warning(
+                            f"Reorder blocked for fragment {frag['index']}: "
+                            f"target occupied, file kept at {frag['output_path']}"
+                        )
+                    break
+                pending = next_pending
+
+            for frag in self._ebook_fragments:
+                p = frag.get('output_path')
+                if p and os.path.exists(p):
+                    try:
+                        self._file_watcher.addPath(p)
+                    except Exception:
+                        pass
+
+            if failed_count:
+                logger.warning(f"Reorder completed with {failed_count} file(s) not renamed")
+                self.main._set_status(
+                    f"{failed_count} audio file(s) could not be renamed and were kept "
+                    f"under temporary names; they will be fixed on the next reorder.",
+                    C["warning"],
+                )
+        finally:
+            self._sanitize_ebook_outputs()
+
+    def _sanitize_ebook_outputs(self) -> int:
+        prefix = Path(self._epub_path).stem if self._epub_path else "ebook_fragment"
+
+        def _norm(p: str) -> str:
+            return os.path.normcase(os.path.abspath(p))
+
+        def _expected(frag: Dict) -> str:
+            return f"{prefix}_{frag['index'] + 1:03d}.wav"
+
+        ordered = sorted(
+            self._ebook_fragments,
+            key=lambda f: 0 if os.path.basename(f.get('output_path') or "") == _expected(f) else 1,
+        )
+
+        claimed = set()
+        reset_count = 0
+        for frag in ordered:
+            if frag.get('status') != 'done':
+                continue
+            path = frag.get('output_path')
+            valid = False
+            if path:
+                try:
+                    valid = os.path.isfile(path) and os.path.getsize(path) > 0
+                except OSError:
+                    valid = False
+            if valid:
+                key = _norm(path)
+                if key in claimed:
+                    valid = False
+                else:
+                    claimed.add(key)
+            if not valid:
+                logger.warning(
+                    f"Fragment {frag['index'] + 1} marked done but audio is missing, "
+                    f"empty or shared: {path}; reset to waiting"
+                )
+                frag['status'] = 'waiting'
+                frag['output_path'] = None
+                frag['error_msg'] = None
+                reset_count += 1
+
+        if reset_count:
+            self.main._set_status(
+                f"{reset_count} fragment(s) had missing or invalid audio and were reset to waiting.",
+                C["warning"],
+            )
+        return reset_count
 
     def _move_ebook_fragment(self, frag: Dict, direction: int):
         pos = next((i for i, f in enumerate(self._ebook_fragments) if f['index'] == frag['index']), -1)
@@ -1530,6 +1843,9 @@ class EbookTab(BaseTab):
         if new_pos < 0 or new_pos >= len(self._ebook_fragments):
             return
 
+        label = f"moving fragment #{frag['index'] + 1} {'down' if direction > 0 else 'up'}"
+        before = self._undo_begin(True)
+
         self._ebook_fragments[pos], self._ebook_fragments[new_pos] = \
             self._ebook_fragments[new_pos], self._ebook_fragments[pos]
 
@@ -1538,6 +1854,7 @@ class EbookTab(BaseTab):
 
         self._rename_ebook_outputs_to_match_order()
         self._populate_ebook_tree()
+        self._undo_commit(label, before)
 
         moved_item = self._ebook_frag_items.get(new_pos)
         if moved_item:
@@ -1634,6 +1951,16 @@ class EbookTab(BaseTab):
         if len(fragments) < 2:
             return
 
+        try:
+            srt_tab = getattr(self.main, 'srt_tab', None)
+            if srt_tab is not None and hasattr(srt_tab, '_release_audio_file_locks'):
+                srt_tab._release_audio_file_locks()
+        except Exception:
+            pass
+        QApplication.processEvents()
+
+        before = self._undo_begin(True)
+
         self.main._stop_play()
 
         combined_text = " ".join(
@@ -1643,6 +1970,7 @@ class EbookTab(BaseTab):
 
         target_sr = 44100
         parts: List[np.ndarray] = []
+        loaded_count = 0
         import torch
         import torchaudio.functional as TAF
         for df in fragments:
@@ -1657,17 +1985,21 @@ class EbookTab(BaseTab):
                         t = TAF.resample(t, sr, target_sr)
                         audio = t.squeeze(0).numpy()
                     parts.append(audio.astype(np.float32))
+                    loaded_count += 1
                 except Exception as e:
                     logger.warning(f"Ebook merge: cannot load {ap}: {e}")
 
         merged_audio_path: Optional[str] = None
         merged_status = 'waiting'
 
-        if parts:
+        if parts and loaded_count == len(fragments):
             try:
                 os.makedirs(self._ebook_output_dir, exist_ok=True)
-                tmp_name = f"__merge_tmp_{abs(hash(tuple(f['index'] for f in fragments))) % 10**9}.wav"
-                tmp_path = os.path.join(self._ebook_output_dir, tmp_name)
+                stamp = time.time_ns()
+                tmp_path = os.path.join(self._ebook_output_dir, f"__merge_tmp_{stamp}.wav")
+                while os.path.exists(tmp_path):
+                    stamp += 1
+                    tmp_path = os.path.join(self._ebook_output_dir, f"__merge_tmp_{stamp}.wav")
                 combined = np.concatenate(parts)
                 sf.write(tmp_path, combined, target_sr, subtype='PCM_16')
                 merged_audio_path = tmp_path
@@ -1675,16 +2007,28 @@ class EbookTab(BaseTab):
             except Exception as e:
                 logger.warning(f"Ebook merge audio write failed: {e}")
 
+        indices_to_remove = {f['index'] for f in fragments}
+
+        kept_paths = {
+            os.path.normcase(os.path.abspath(f['output_path']))
+            for f in self._ebook_fragments
+            if f['index'] not in indices_to_remove and f.get('output_path')
+        }
+
         for f in fragments:
             p = f.get('output_path', '')
             if p and os.path.exists(p):
-                self._file_watcher.removePath(p)
+                try:
+                    self._file_watcher.removePath(p)
+                except Exception:
+                    pass
+                if os.path.normcase(os.path.abspath(p)) in kept_paths:
+                    continue
                 try:
                     os.remove(p)
                 except Exception as e:
                     logger.warning(f"Could not delete orphan audio {p}: {e}")
 
-        indices_to_remove = {f['index'] for f in fragments}
         insert_pos = min(
             i for i, f in enumerate(self._ebook_fragments) if f['index'] in indices_to_remove
         )
@@ -1708,8 +2052,12 @@ class EbookTab(BaseTab):
 
         self._rename_ebook_outputs_to_match_order()
 
-        if merged_audio_path and os.path.exists(merged_audio_path):
-            self._file_watcher.addPath(merged_audio_path)
+        final_path = merged_frag.get('output_path')
+        if final_path and os.path.exists(final_path):
+            try:
+                self._file_watcher.addPath(final_path)
+            except Exception:
+                pass
 
         if self.main._current_fragment_idx in indices_to_remove:
             self.main._current_fragment_idx = None
@@ -1723,9 +2071,12 @@ class EbookTab(BaseTab):
         self._populate_ebook_tree()
         self.main._update_action_buttons()
         self._update_preview_btn_state()
+        self._undo_commit(f"merge of {len(fragments)} fragments", before)
 
         self.main._set_status(
-            f"Merged {len(fragments)} ebook fragments into one.", C["accent"]
+            f"Merged {len(fragments)} ebook fragments into one."
+            + ("" if merged_status == 'done' else "  Re-synthesis required."),
+            C["accent"],
         )
 
     # ------------------------------------------------------------------
@@ -2263,9 +2614,14 @@ class EbookTab(BaseTab):
     def _save_ebook_session(self):
         if not self._epub_path:
             return
-        default_path = str(
-            Path(_get_last_dir("session", str(OUTPUTS_DIR))) / "ebook_session.json"
-        )
+        user_path = self._user_ebook_session_path()
+        if user_path is not None:
+            os.makedirs(os.path.dirname(str(user_path)), exist_ok=True)
+            default_path = str(user_path)
+        else:
+            default_path = str(
+                Path(_get_last_dir("session", str(OUTPUTS_DIR))) / "ebook_session.json"
+            )
         path, _ = QFileDialog.getSaveFileName(
             self.main, "Save ebook session", default_path,
             "JSON (*.json);;All files (*)",
@@ -2273,13 +2629,14 @@ class EbookTab(BaseTab):
         if not path:
             return
         _set_last_dir("session", path)
-        if self._write_ebook_session_to(path):
-            auto = self._auto_ebook_session_path()
-            if auto and str(auto) != path:
-                self._write_ebook_session_to(str(auto))
+        if self._write_manual_ebook_session_to(path):
             self.main._set_status(f"Ebook session saved: {path}", C["success"])
         else:
-            QMessageBox.critical(self.main, "Save error", f"Could not write session to:\n{path}")
+            QMessageBox.critical(
+                self.main, "Save error",
+                f"Could not write session to:\n{path}\n\n"
+                "A manual session cannot be saved into the autosession folder."
+            )
 
     def _load_session(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2296,15 +2653,39 @@ class EbookTab(BaseTab):
             QMessageBox.critical(self.main, "Load error", str(e))
             return
 
+        self.main.undo_manager.clear()
         if data.get("session_type") == "ebook":
             self._restore_ebook_session_data(data)
         else:
             self.main.srt_tab._restore_session_data(data)
 
-    def _auto_ebook_session_path(self) -> Optional[Path]:
+    @staticmethod
+    def _session_dirs(path: str) -> Tuple[Path, Path]:
+        stem = Path(path).stem
+        root = Path(OUTPUTS_DIR) / stem
+        return root / stem, root / f"{stem}_autosession"
+
+    def _manual_ebook_session_dir(self) -> Optional[Path]:
         if not self._epub_path:
             return None
-        return OUTPUTS_DIR / Path(self._epub_path).stem / "ebook_session.json"
+        return self._session_dirs(self._epub_path)[0]
+
+    def _auto_ebook_session_dir(self) -> Optional[Path]:
+        if not self._epub_path:
+            return None
+        return self._session_dirs(self._epub_path)[1]
+
+    def _auto_ebook_session_path(self) -> Optional[Path]:
+        auto_dir = self._auto_ebook_session_dir()
+        if auto_dir is None:
+            return None
+        return auto_dir / "ebook_autosession.json"
+
+    def _user_ebook_session_path(self) -> Optional[Path]:
+        manual_dir = self._manual_ebook_session_dir()
+        if manual_dir is None:
+            return None
+        return manual_dir / "ebook_session.json"
 
     def _build_ebook_session_data(self) -> dict:
         ref_audio = self.main._drop.file_path
@@ -2336,7 +2717,219 @@ class EbookTab(BaseTab):
             logger.warning(f"Ebook session write failed: {e}")
             return False
 
+    def _write_manual_ebook_session_to(self, path: str) -> bool:
+        def _norm(p: str) -> str:
+            return os.path.normcase(os.path.abspath(p))
+
+        try:
+            target_dir = os.path.dirname(os.path.abspath(path))
+            auto_dir = self._auto_ebook_session_dir()
+            if auto_dir is not None and _norm(str(auto_dir)) == _norm(target_dir):
+                logger.warning("Manual ebook session cannot be written into the autosession folder")
+                return False
+            os.makedirs(target_dir, exist_ok=True)
+
+            previous: Set[str] = set()
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        old_data = json.load(fh)
+                    for old_frag in old_data.get("fragments", []):
+                        old_path = old_frag.get("output_path")
+                        if old_path and os.path.dirname(_norm(old_path)) == _norm(target_dir):
+                            previous.add(_norm(old_path))
+                except Exception:
+                    previous = set()
+
+            data = self._build_ebook_session_data()
+            mapping: Dict[str, str] = {}
+            used: Set[str] = set()
+            for frag in data["fragments"]:
+                src = frag.get("output_path")
+                if not src or not os.path.isfile(src):
+                    continue
+                key = _norm(src)
+                if key not in mapping:
+                    dst = os.path.join(target_dir, os.path.basename(src))
+                    root, ext = os.path.splitext(dst)
+                    n = 1
+                    while _norm(dst) in used:
+                        dst = f"{root}_{n}{ext}"
+                        n += 1
+                    if _norm(dst) != key:
+                        shutil.copy2(src, dst)
+                    used.add(_norm(dst))
+                    mapping[key] = dst
+                frag["output_path"] = mapping[key]
+            data["ebook_output_dir"] = target_dir
+
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False)
+
+            prefix = Path(self._epub_path).stem if self._epub_path else "ebook_fragment"
+            audio_exts = {".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a"}
+            delete_targets: Set[str] = set(previous)
+            if prefix:
+                try:
+                    for entry in os.scandir(target_dir):
+                        if not entry.is_file():
+                            continue
+                        ext = os.path.splitext(entry.name)[1].lower()
+                        if ext not in audio_exts:
+                            continue
+                        name = entry.name
+                        if (
+                            name.startswith(prefix + "_")
+                            or name.startswith("__merge_tmp_")
+                            or name.startswith("_lektor_track_tmp")
+                        ):
+                            delete_targets.add(_norm(entry.path))
+                except OSError:
+                    pass
+
+            for stale in delete_targets - used:
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+            return True
+        except Exception as e:
+            logger.warning(f"Manual ebook session write failed: {e}")
+            return False
+
+    def _recover_ebook_missing_audio(self, data: dict) -> dict:
+        epub_path = data.get("epub_path") or ""
+        if not epub_path:
+            return data
+
+        def _norm(p: str) -> str:
+            return os.path.normcase(os.path.abspath(p))
+
+        stem = Path(epub_path).stem
+        candidate_dirs: List[str] = []
+        seen: Set[str] = set()
+        for raw in (
+            str(Path(OUTPUTS_DIR) / stem / stem),
+            str(Path(OUTPUTS_DIR) / stem / f"{stem}_autosession"),
+            data.get("ebook_output_dir") or "",
+        ):
+            if not raw:
+                continue
+            ad = os.path.abspath(raw)
+            if not os.path.isdir(ad):
+                continue
+            key = _norm(ad)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidate_dirs.append(ad)
+
+        if not candidate_dirs:
+            return data
+
+        fragments = [dict(f) for f in data.get("fragments", [])]
+        changed = False
+        for frag in fragments:
+            existing = frag.get("output_path")
+            if existing:
+                try:
+                    if os.path.isfile(existing) and os.path.getsize(existing) > 0:
+                        continue
+                except OSError:
+                    pass
+            idx = frag.get("index")
+            if idx is None:
+                continue
+            try:
+                idx_int = int(idx)
+            except (TypeError, ValueError):
+                continue
+            expected_name = f"{stem}_{idx_int + 1:03d}.wav"
+            for d in candidate_dirs:
+                candidate = os.path.join(d, expected_name)
+                try:
+                    if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                        frag["output_path"] = candidate
+                        frag["status"] = "done"
+                        frag["error_msg"] = None
+                        changed = True
+                        logger.info(
+                            f"Recovered missing ebook audio for fragment #{idx_int + 1}: {candidate}"
+                        )
+                        break
+                except OSError:
+                    continue
+
+        if not changed:
+            return data
+
+        result = dict(data)
+        result["fragments"] = fragments
+        return result
+
+    def _relocate_ebook_session_data(self, data: dict) -> dict:
+        epub_path = data.get("epub_path") or ""
+        if not epub_path:
+            return data
+        data = self._recover_ebook_missing_audio(data)
+
+        def _norm(p: str) -> str:
+            return os.path.normcase(os.path.abspath(p))
+
+        auto_dir = os.path.abspath(str(self._session_dirs(epub_path)[1]))
+        auto_key = _norm(auto_dir)
+        fragments = [dict(f) for f in data.get("fragments", [])]
+
+        sources = [
+            f["output_path"] for f in fragments
+            if f.get("output_path") and os.path.isfile(f["output_path"])
+        ]
+        if any(os.path.dirname(_norm(s)) != auto_key for s in sources):
+            try:
+                srt_tab = getattr(self.main, 'srt_tab', None)
+                if srt_tab is not None and hasattr(srt_tab, '_release_audio_file_locks'):
+                    srt_tab._release_audio_file_locks()
+            except Exception:
+                pass
+
+        os.makedirs(auto_dir, exist_ok=True)
+        used: Set[str] = {_norm(s) for s in sources if os.path.dirname(_norm(s)) == auto_key}
+        mapping: Dict[str, Optional[str]] = {}
+        for frag in fragments:
+            src = frag.get("output_path")
+            if not src or not os.path.isfile(src):
+                continue
+            key = _norm(src)
+            if key not in mapping:
+                if os.path.dirname(key) == auto_key:
+                    mapping[key] = src
+                else:
+                    dst = os.path.join(auto_dir, os.path.basename(src))
+                    root, ext = os.path.splitext(dst)
+                    n = 1
+                    while _norm(dst) in used:
+                        dst = f"{root}_{n}{ext}"
+                        n += 1
+                    try:
+                        shutil.copy2(src, dst)
+                        used.add(_norm(dst))
+                        mapping[key] = dst
+                    except OSError as e:
+                        logger.warning(f"Could not copy {src} to {dst}: {e}")
+                        mapping[key] = None
+            frag["output_path"] = mapping[key]
+            if mapping[key] is None:
+                frag["status"] = "waiting"
+
+        result = dict(data)
+        result["fragments"] = fragments
+        result["ebook_output_dir"] = auto_dir
+        return result
+
     def _restore_ebook_session_data(self, data: dict):
+        self._apply_ebook_session_data(self._relocate_ebook_session_data(data))
+
+    def _apply_ebook_session_data(self, data: dict):
         self._epub_path = data.get("epub_path", "")
         self._ebook_output_dir = data.get("ebook_output_dir", str(OUTPUTS_DIR))
         if self._audiobook_output_edit is not None:
