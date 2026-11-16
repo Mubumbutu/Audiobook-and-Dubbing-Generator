@@ -667,26 +667,26 @@ class RefAudioPlayer(QWidget):
             return
         self._playing = True
         self._play_btn.setText("■  Pause")
-        audio = self._data.astype(np.float32)
-        chunk = audio[self._cursor:] if self._cursor < len(audio) else audio
-        if not len(chunk):
+        audio = self._data
+        if self._cursor >= len(audio):
             self._cursor = 0
-            chunk = audio
+        end = len(audio)
+        pos = self._cursor
 
         def cb(out, frames, ti, st):
-            nonlocal chunk
+            nonlocal pos
             if not self._playing:
                 raise sd.CallbackStop()
-            n = min(frames, len(chunk))
-            if n == 0:
+            n = min(frames, end - pos)
+            if n <= 0:
                 out[:] = 0
                 raise sd.CallbackStop()
             vol = self._vol.value() / 100.0
-            out[:n, 0] = chunk[:n] * vol
+            out[:n, 0] = audio[pos:pos + n] * vol
             if frames > n:
                 out[n:] = 0
-            chunk = chunk[n:]
-            self._cursor += n
+            pos += n
+            self._cursor = pos
 
         try:
             self._stream = sd.OutputStream(
@@ -908,36 +908,36 @@ class VideoAudioPlayer(QWidget):
         self._playing = True
         self._play_btn.setText("■  Pause")
 
-        audio = self._data.astype(np.float32)
+        audio = self._data
 
         s_sample = self._cursor if 0 <= self._cursor < len(audio) else 0
         e_sample = len(audio)
         self._cursor   = s_sample
         self._play_end = e_sample
-        chunk = audio[s_sample:e_sample].copy()
 
-        if not len(chunk):
+        if s_sample >= e_sample:
             self._playing = False
             self._play_btn.setText("▶  Play")
             return
 
         self._play_gen += 1
         gen = self._play_gen
+        pos = s_sample
 
         def cb(out, frames, ti, st):
-            nonlocal chunk
+            nonlocal pos
             if not self._playing or gen != self._play_gen:
                 raise sd.CallbackStop()
-            n = min(frames, len(chunk))
-            if n == 0:
+            n = min(frames, e_sample - pos)
+            if n <= 0:
                 out[:] = 0
                 raise sd.CallbackStop()
             vol = self._vol.value() / 100.0
-            out[:n, 0] = chunk[:n] * vol
+            out[:n, 0] = audio[pos:pos + n] * vol
             if frames > n:
                 out[n:] = 0
-            chunk = chunk[n:]
-            self._cursor += n
+            pos += n
+            self._cursor = pos
 
         def _finished(gen=gen):
             self._on_end(gen)
