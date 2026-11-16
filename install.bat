@@ -28,13 +28,14 @@ echo  [13]  Supertonic 3
 echo  [14]  TADA TTS  (requires HuggingFace token + Meta license approval)
 echo  [15]  VoxCPM 2
 echo  [16]  XTTS v2  (Coqui TTS)
+echo  [17]  ZONOS3-Mini  (SGLang-Omni via WSL2 / Docker, requires NVIDIA GPU)
 echo.
 echo  [0]   Exit
 echo.
 
 :PICK
 set CHOICE=
-set /p CHOICE=Enter choice [0-16]: 
+set /p CHOICE=Enter choice [0-17]: 
 
 if "!CHOICE!"=="0"  goto :EXIT
 if "!CHOICE!"=="1"  goto :AUDIO8
@@ -53,8 +54,9 @@ if "!CHOICE!"=="13" goto :SUPERTONIC
 if "!CHOICE!"=="14" goto :TADA
 if "!CHOICE!"=="15" goto :VOXCPM2
 if "!CHOICE!"=="16" goto :XTTSV2
+if "!CHOICE!"=="17" goto :ZONOS3MINI
 
-echo  Invalid choice. Please enter a number from 0 to 16.
+echo  Invalid choice. Please enter a number from 0 to 17.
 goto :PICK
 
 :AUDIO8
@@ -135,6 +137,11 @@ goto :RUN
 :XTTSV2
 set "SCRIPT=%APP_ROOT%install\xttsv2_install.bat"
 set "MODEL=XTTS v2 (Coqui TTS)"
+goto :RUN
+
+:ZONOS3MINI
+set "SCRIPT=%APP_ROOT%install\zonos3_mini_install.bat"
+set "MODEL=ZONOS3-Mini (SGLang-Omni / WSL2 / Docker)"
 goto :RUN
 
 :RUN
