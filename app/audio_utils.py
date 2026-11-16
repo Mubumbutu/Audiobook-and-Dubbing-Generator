@@ -1,6 +1,7 @@
 # audio_utils.py
 import os
 import logging
+import threading
 from typing import Optional, List, Dict, Tuple, Callable
 
 import numpy as np
@@ -14,19 +15,195 @@ from utils import _compute_trim_bounds, _get_wav_duration
 
 logger = logging.getLogger(__name__)
 
+_FADE_SECONDS = 0.01
+_STREAM_LATENCY = 0.05
+
+
+class _PlaybackEngine:
+    def __init__(self, sr: int):
+        self.sr = int(sr)
+        self.volume = 1.0
+        self.finished = False
+        self._lock = threading.Lock()
+        self._silent = threading.Event()
+        self._silent.set()
+        n = max(8, int(self.sr * _FADE_SECONDS))
+        t = (np.arange(n, dtype=np.float32) + 0.5) / n
+        self._fade_in = (0.5 - 0.5 * np.cos(np.pi * t)).astype(np.float32)
+        self._fade_out = self._fade_in[::-1].copy()
+        self._fade_len = n
+        self._audio = None
+        self._pos = 0
+        self._start = 0
+        self._end = 0
+        self._fade_in_pos = 0
+        self._stop_pos = -1
+        self._pending = None
+        self._gain = 1.0
+        self._latency = 0
+        self._stream = None
+
+    def open(self):
+        last_error = None
+        for latency in (_STREAM_LATENCY, None):
+            kwargs = dict(samplerate=self.sr, channels=1, dtype="float32",
+                          callback=self._callback)
+            if latency is not None:
+                kwargs["latency"] = latency
+            stream = None
+            try:
+                stream = sd.OutputStream(**kwargs)
+                stream.start()
+            except Exception as e:
+                last_error = e
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                continue
+            self._stream = stream
+            try:
+                self._latency = int(float(stream.latency) * self.sr)
+            except Exception:
+                self._latency = 0
+            return
+        raise last_error
+
+    def is_alive(self) -> bool:
+        s = self._stream
+        try:
+            return s is not None and not s.closed and s.active
+        except Exception:
+            return False
+
+    def close(self):
+        self.stop()
+        self._silent.wait(0.05)
+        s = self._stream
+        self._stream = None
+        if s is not None:
+            try:
+                s.stop()
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def play(self, audio: np.ndarray, start: int, end: int):
+        end = max(0, min(int(end), len(audio)))
+        start = max(0, min(int(start), end))
+        with self._lock:
+            job = (audio, start, end)
+            if self._audio is None:
+                self._gain = self.volume
+                self._install(job)
+            else:
+                self._pending = job
+                if self._stop_pos < 0:
+                    self._stop_pos = 0
+
+    def stop(self):
+        with self._lock:
+            self._pending = None
+            if self._audio is not None and self._stop_pos < 0:
+                self._stop_pos = 0
+
+    def position(self) -> int:
+        return max(self._start, min(self._pos, self._end) - self._latency)
+
+    def _install(self, job):
+        self._audio, self._pos, self._end = job
+        self._start = self._pos
+        self._fade_in_pos = 0
+        self._stop_pos = -1
+        self._pending = None
+        self.finished = False
+        self._silent.clear()
+
+    def _finish(self):
+        natural = self._stop_pos < 0
+        pending = self._pending
+        self._audio = None
+        self._pending = None
+        self._stop_pos = -1
+        if pending is not None:
+            self._install(pending)
+        else:
+            self.finished = natural
+            self._silent.set()
+
+    def _callback(self, outdata, frames, time_info, status):
+        outdata.fill(0.0)
+        with self._lock:
+            filled = 0
+            while filled < frames and self._audio is not None:
+                n = min(frames - filled, self._end - self._pos)
+                if self._stop_pos >= 0:
+                    n = min(n, self._fade_len - self._stop_pos)
+                if n <= 0:
+                    self._finish()
+                    continue
+                seg = self._audio[self._pos:self._pos + n]
+                env = np.empty(n, dtype=np.float32)
+                target = self.volume
+                if target != self._gain:
+                    env[:] = np.linspace(self._gain, target, n + 1, dtype=np.float32)[1:]
+                    self._gain = target
+                else:
+                    env[:] = target
+                if self._fade_in_pos < self._fade_len:
+                    k = min(n, self._fade_len - self._fade_in_pos)
+                    env[:k] *= self._fade_in[self._fade_in_pos:self._fade_in_pos + k]
+                    self._fade_in_pos += k
+                remaining = self._end - self._pos
+                if remaining - n < self._fade_len:
+                    j0 = max(0, remaining - self._fade_len)
+                    rem = remaining - np.arange(j0, n)
+                    env[j0:] *= self._fade_in[rem - 1]
+                if self._stop_pos >= 0:
+                    env *= self._fade_out[self._stop_pos:self._stop_pos + n]
+                    self._stop_pos += n
+                outdata[filled:filled + n, 0] = seg * env
+                self._pos += n
+                filled += n
+
+
+def _get_engine(main_window, sr: int) -> "_PlaybackEngine":
+    engine = getattr(main_window, '_engine', None)
+    if engine is not None and (engine.sr != int(sr) or not engine.is_alive()):
+        engine.close()
+        engine = None
+        main_window._engine = None
+    if engine is None:
+        engine = _PlaybackEngine(sr)
+        engine.open()
+        main_window._engine = engine
+        main_window._stream = engine._stream
+    return engine
+
+
+def _engine_stop(main_window):
+    engine = getattr(main_window, '_engine', None)
+    if engine is not None:
+        engine.stop()
+
+
+def release_player(main_window):
+    engine = getattr(main_window, '_engine', None)
+    main_window._engine = None
+    main_window._stream = None
+    if engine is not None:
+        engine.close()
 
 def load_audio_to_player(main_window, audio: np.ndarray, sr: int,
                           fragment_idx: Optional[int] = None):
     main_window._playing = False
     main_window._play_btn.setText("▶ Play")
     main_window._timer.stop()
-    if main_window._stream:
-        try:
-            main_window._stream.stop()
-            main_window._stream.close()
-        except Exception:
-            pass
-        main_window._stream = None
+    _engine_stop(main_window)
 
     main_window._audio_data = audio
     main_window._audio_sr = sr
@@ -34,9 +211,15 @@ def load_audio_to_player(main_window, audio: np.ndarray, sr: int,
     main_window._play_end_sample = len(audio)
 
     main_window._wave_out.set_audio(audio)
+    main_window._wave_out.clear_selection()
     main_window._wave_out.clear_trim_preview()
     main_window._wave_out.set_position(0.0)
     main_window._cursor = 0
+
+    try:
+        _get_engine(main_window, sr)
+    except Exception:
+        pass
 
     dur = len(audio) / max(1, sr)
     main_window._time_lbl.setText(f"0:00 / {_fmt(dur)}")
@@ -63,8 +246,6 @@ def toggle_play(main_window):
 def start_play(main_window):
     if main_window._audio_data is None:
         return
-    main_window._playing = True
-    main_window._play_btn.setText("■  Pause")
 
     audio = main_window._audio_data.astype(np.float32)
 
@@ -78,8 +259,13 @@ def start_play(main_window):
 
     sel = main_window._wave_out.get_selection()
     if sel:
-        s_sample = int(sel[0] * len(audio))
-        e_sample = int(sel[1] * len(audio))
+        sel_start = int(sel[0] * len(audio))
+        sel_end = int(sel[1] * len(audio))
+        if sel_start <= main_window._cursor < sel_end:
+            s_sample = main_window._cursor
+        else:
+            s_sample = sel_start
+        e_sample = sel_end
     else:
         s_sample = max(lead_s, main_window._cursor) if main_window._cursor < trimmed_end else lead_s
         e_sample = trimmed_end
@@ -88,65 +274,46 @@ def start_play(main_window):
         s_sample = lead_s
         e_sample = trimmed_end
 
-    main_window._cursor = s_sample
-    main_window._play_end_sample = e_sample
-    chunk = audio[s_sample:e_sample].copy()
-
-    if not len(chunk):
+    if e_sample - s_sample <= 0:
         main_window._playing = False
         main_window._play_btn.setText("▶  Play")
         return
 
-    def cb(out, frames, ti, st):
-        nonlocal chunk
-        if not main_window._playing:
-            raise sd.CallbackStop()
-        n = min(frames, len(chunk))
-        if n == 0:
-            out[:] = 0
-            raise sd.CallbackStop()
-        vol = main_window._vol.value() / 100.0
-        out[:n, 0] = chunk[:n] * vol
-        if frames > n:
-            out[n:] = 0
-        chunk = chunk[n:]
-        main_window._cursor += n
-
     try:
-        main_window._stream = sd.OutputStream(
-            samplerate=main_window._audio_sr, channels=1, dtype="float32",
-            callback=cb, finished_callback=main_window._on_play_end,
-        )
-        main_window._stream.start()
-        main_window._timer.start()
+        engine = _get_engine(main_window, main_window._audio_sr)
+        engine.volume = main_window._vol.value() / 100.0
+        engine.play(audio, s_sample, e_sample)
     except Exception as e:
         main_window._playing = False
         main_window._play_btn.setText("▶  Play")
         main_window._set_status(f"Playback error: {e}", C["error"])
+        return
+
+    main_window._cursor = s_sample
+    main_window._play_end_sample = e_sample
+    main_window._playing = True
+    main_window._play_btn.setText("■  Pause")
+    main_window._timer.start()
 
 
 def pause_play(main_window):
+    engine = getattr(main_window, '_engine', None)
+    if engine is not None and main_window._playing:
+        main_window._cursor = engine.position()
+        engine.stop()
     main_window._playing = False
     main_window._play_btn.setText("▶  Play")
     main_window._timer.stop()
-    if main_window._stream:
-        try:
-            main_window._stream.stop()
-        except Exception:
-            pass
+    if main_window._audio_data is not None and hasattr(main_window, '_wave_out'):
+        total = len(main_window._audio_data)
+        main_window._wave_out.set_position(min(main_window._cursor, total) / max(1, total))
 
 
 def stop_play(main_window):
     main_window._playing = False
     main_window._play_btn.setText("▶  Play")
     main_window._timer.stop()
-    if main_window._stream:
-        try:
-            main_window._stream.stop()
-            main_window._stream.close()
-        except Exception:
-            pass
-        main_window._stream = None
+    _engine_stop(main_window)
     if main_window._audio_data is not None and hasattr(main_window, '_wave_out'):
         sel = main_window._wave_out.get_selection()
         if sel:
@@ -166,33 +333,41 @@ def stop_play(main_window):
 
 
 def on_play_end(main_window):
-    def _safe():
-        main_window._playing = False
-        main_window._play_btn.setText("▶  Play")
-        main_window._timer.stop()
-        if main_window._audio_data is not None and hasattr(main_window, '_wave_out'):
-            sel = main_window._wave_out.get_selection()
-            if sel:
-                main_window._cursor = int(sel[0] * len(main_window._audio_data))
-            else:
-                aggressiveness = main_window._trim_slider.value() / 10.0 if hasattr(main_window, '_trim_slider') else 0.0
-                lead_s = 0
-                if aggressiveness > 0.0:
-                    _, _, lead_s, _ = _compute_trim_bounds(
-                        main_window._audio_data.astype(np.float32), main_window._audio_sr, aggressiveness
-                    )
-                main_window._cursor = lead_s
-            main_window._wave_out.set_position(main_window._cursor / max(1, len(main_window._audio_data)))
-            main_window._time_lbl.setText(
-                f"{_fmt(main_window._cursor / max(1, main_window._audio_sr))} / "
-                f"{_fmt(len(main_window._audio_data) / max(1, main_window._audio_sr))}"
-            )
-    QTimer.singleShot(0, _safe)
+    engine = getattr(main_window, '_engine', None)
+    if engine is not None:
+        engine.finished = False
+    main_window._playing = False
+    main_window._play_btn.setText("▶  Play")
+    main_window._timer.stop()
+    if main_window._audio_data is not None and hasattr(main_window, '_wave_out'):
+        sel = main_window._wave_out.get_selection()
+        if sel:
+            main_window._cursor = int(sel[0] * len(main_window._audio_data))
+        else:
+            aggressiveness = main_window._trim_slider.value() / 10.0 if hasattr(main_window, '_trim_slider') else 0.0
+            lead_s = 0
+            if aggressiveness > 0.0:
+                _, _, lead_s, _ = _compute_trim_bounds(
+                    main_window._audio_data.astype(np.float32), main_window._audio_sr, aggressiveness
+                )
+            main_window._cursor = lead_s
+        main_window._wave_out.set_position(main_window._cursor / max(1, len(main_window._audio_data)))
+        main_window._time_lbl.setText(
+            f"{_fmt(main_window._cursor / max(1, main_window._audio_sr))} / "
+            f"{_fmt(len(main_window._audio_data) / max(1, main_window._audio_sr))}"
+        )
 
 
 def playback_tick(main_window):
     if main_window._audio_data is None:
         return
+    engine = getattr(main_window, '_engine', None)
+    if engine is not None and main_window._playing:
+        engine.volume = main_window._vol.value() / 100.0
+        if engine.finished:
+            on_play_end(main_window)
+            return
+        main_window._cursor = engine.position()
     total = len(main_window._audio_data)
     pos   = min(main_window._cursor, total) / max(1, total)
     if hasattr(main_window, '_wave_out'):
