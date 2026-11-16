@@ -34,13 +34,6 @@ def _parse_speaker(text: str) -> Tuple[Optional[str], str]:
     m = re.match(r'^\[([^\]]+)\]\s*', text)
     if m:
         return m.group(1).strip(), text[m.end():].strip()
-    m = re.match(
-        r'^([A-ZÁÉÍÓÚÀÈÌÒÙÂÊÎÔÛÄËÏÖÜÃÕŇČŠŽ][A-ZÁÉÍÓÚÀÈÌÒÙÂÊÎÔÛÄËÏÖÜÃÕŇČŠŽa-z]*'
-        r'(?:\s[A-ZÁÉÍÓÚÀÈÌÒÙÂÊÎÔÛÄËÏÖÜÃÕŇČŠŽ][A-Za-z]*)*):\s*',
-        text
-    )
-    if m:
-        return m.group(1).strip(), text[m.end():].strip()
     return None, text
 
 
