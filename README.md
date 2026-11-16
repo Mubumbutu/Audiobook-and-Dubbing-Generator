@@ -36,7 +36,7 @@ A desktop application for AI-powered text-to-speech synthesis, Lektor-style audi
 
 <br>
 
-### [1.1.1] - 2026-11-07
+### [1.1.1] - 2026-11-16
 
 After this update, I recommend creating new projects. If you have an unfinished project, please complete it using the previous version.
 
