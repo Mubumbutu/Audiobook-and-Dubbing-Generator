@@ -40,6 +40,7 @@ set "LABEL_venv_supertonic=Supertonic 3"
 set "LABEL_venv_tada=TADA TTS"
 set "LABEL_venv_voxcpm2=VoxCPM 2"
 set "LABEL_venv_xttsv2=XTTS v2"
+set "LABEL_venv_zonos3_mini=ZONOS3-Mini (WSL2)"
 
 set COUNT=0
 for /f "delims=" %%D in ('dir /b /ad /on "venvs" 2^>nul') do (
