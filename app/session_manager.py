@@ -2,6 +2,7 @@
 import logging
 import os
 import json
+import time
 from pathlib import Path
 from typing import Optional, Dict, List
 
@@ -13,10 +14,39 @@ from utils import _ref_audio_hash, _ms_to_ts
 logger = logging.getLogger(__name__)
 
 
+def choose_session_file(parent, candidates) -> Optional[Path]:
+    existing: List[Path] = []
+    for p in candidates:
+        if p and Path(p).exists() and Path(p) not in existing:
+            existing.append(Path(p))
+    if not existing:
+        return None
+    if len(existing) == 1:
+        reply = QMessageBox.question(
+            parent, "Restore previous session",
+            "A saved session was found for this file.\n\n"
+            "Restore it? Previously synthesized fragments will be loaded automatically.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        return existing[0] if reply == QMessageBox.StandardButton.Yes else None
+    box = QMessageBox(parent)
+    box.setWindowTitle("Restore previous session")
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setText("Two saved sessions were found for this file.\n\nWhich one do you want to restore?")
+    buttons = {}
+    for p in existing:
+        kind = "Autosession" if "autosession" in p.name.lower() else "Saved session"
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(p.stat().st_mtime))
+        buttons[box.addButton(f"{kind}  ({stamp})", QMessageBox.ButtonRole.ActionRole)] = p
+    fresh_btn = box.addButton("Start fresh", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(fresh_btn)
+    box.exec()
+    return buttons.get(box.clickedButton())
+
 def _auto_session_path(main_window) -> Optional[Path]:
     if not main_window._srt_path:
         return None
-    return OUTPUTS_DIR / Path(main_window._srt_path).stem / "session.json"
+    return OUTPUTS_DIR / Path(main_window._srt_path).stem / "autosession.json"
 
 
 def _build_session_data(main_window) -> dict:
@@ -316,7 +346,7 @@ def _restore_session_data(main_window, data: dict):
 def _auto_ebook_session_path(main_window) -> Optional[Path]:
     if not main_window._epub_path:
         return None
-    return OUTPUTS_DIR / Path(main_window._epub_path).stem / "ebook_session.json"
+    return OUTPUTS_DIR / Path(main_window._epub_path).stem / "ebook_autosession.json"
 
 
 def _build_ebook_session_data(main_window) -> dict:
