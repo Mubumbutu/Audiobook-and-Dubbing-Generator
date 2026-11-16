@@ -44,7 +44,6 @@ After this update, I recommend creating new projects. If you have an unfinished 
 - ZONOS3-Mini backend (WSL2 / Docker / SGLang-Omni) - You need a minimum of 12 GB of VRAM and 32 GB of RAM. Additionally, in Docker Desktop, you need to allocate 20 GB of memory to the container.
 
 **Fixed**
-- Deleting a fragment now also removes its audio file from disk — no orphan files left behind.
 - Fixed file locking that blocked audio deletion while the player or dubbing simulation was active.
 - Fixed file renaming after fragment removal — no more stale files or `.__reorder__` leftovers.
 - Files that can't be deleted (e.g. locked by another process) are now moved to `__undo_backup` instead of cluttering the output folder.
