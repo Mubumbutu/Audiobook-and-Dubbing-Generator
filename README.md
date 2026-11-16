@@ -4,7 +4,7 @@
 
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.1.0-blue" />
+  <img alt="Version" src="https://img.shields.io/badge/version-1.1.1-blue" />
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white" />
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-lightgrey" />
   <img alt="CUDA" src="https://img.shields.io/badge/CUDA-11.8%20%7C%2012.1%20%7C%2012.4-76b900?logo=nvidia&logoColor=white" />
@@ -35,6 +35,31 @@ A desktop application for AI-powered text-to-speech synthesis, Lektor-style audi
 <summary><b>Version history</b> (click to expand)</summary>
 
 <br>
+
+### [1.1.1] - 2026-11-07
+
+After this update, I recommend creating new projects. If you have an unfinished project, please complete it using the previous version.
+
+**Added**
+- ZONOS3-Mini backend (WSL2 / Docker / SGLang-Omni) - You need a minimum of 12 GB of VRAM and 32 GB of RAM. Additionally, in Docker Desktop, you need to allocate 20 GB of memory to the container.
+
+**Fixed**
+- Deleting a fragment now also removes its audio file from disk — no orphan files left behind.
+- Fixed file locking that blocked audio deletion while the player or dubbing simulation was active.
+- Fixed file renaming after fragment removal — no more stale files or `.__reorder__` leftovers.
+- Files that can't be deleted (e.g. locked by another process) are now moved to `__undo_backup` instead of cluttering the output folder.
+- Synthesis no longer fails with a "file in use" error when the video preview or dubbing simulation has an audio file open.
+- The Fragment preview panel now follows the currently playing fragment during video playback.
+- Clicking a fragment during playback now correctly shows the clicked fragment in the preview.
+- Clicking a fragment now scrolls the video to its timestamp again (fixed after a regression).
+- Merging fragments where only some (or none) of them have generated audio no longer produces a result incorrectly marked as "done". The merged fragment now correctly stays in "waiting" status with no audio attached, and a "Re-synthesis required." note appears in the status bar — in both the SRT tab and the Ebook tab.
+- Merge-by-gap in the SRT tab reports groups where not all fragments had audio as requiring re-synthesis instead of silently marking them as done.
+- The fragment list no longer jumps to the clicked fragment when the video is paused — the row is still highlighted and the video still seeks, but scrolling only happens during playback or when clicking the video waveform.
+- Fragment checkbox selections are now preserved across tree rebuilds (remove, merge, move, add, undo) and saved in the session file — in both the SRT and Ebook tabs.
+- The Ebook fragment filter now searches the full fragment text (not just the 75-character preview) and the speaker field, ignoring whitespace differences.
+- The filter is now reapplied automatically after the fragment list is rebuilt, so it no longer stops working after a rebuild.
+- All / None / Failed / Pending now affect only visible fragments when a filter is active — hidden fragments are unchecked and no longer silently included in TTS.
+- And many smaller fixes.
 
 ### [1.1.0] - 2026-11-01
 **Added**
@@ -136,6 +161,7 @@ The app supports multiple TTS backends. Available backends are detected automati
 | Veena | [huggingface.co/maya-research/Veena](https://huggingface.co/maya-research/Veena) |
 | Maya1 | [huggingface.co/maya-research/maya1](https://huggingface.co/maya-research/maya1) |
 | Maya2 Native | [huggingface.co/maya-research/maya2-native](https://huggingface.co/maya-research/maya2-native) |
+| ZONOS3 Mini | [huggingface.co/Zyphra/ZONOS3-Mini](https://huggingface.co/Zyphra/ZONOS3-Mini) |
 
 Most backends support **voice cloning** via a reference audio file. You can upload a reference `.wav`, optionally pre-process it (resample, convert to mono, normalize, isolate vocals via Demucs), and optionally transcribe it using Whisper before synthesis.
 
