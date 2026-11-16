@@ -107,6 +107,7 @@ Before running any installer, make sure the following are available on your syst
 - **Python 3.10+** — [python.org/downloads](https://www.python.org/downloads/) — check *"Add Python to PATH"* during installation
 - **Git** — [git-scm.com/download/win](https://git-scm.com/download/win)
 - **ffmpeg** — [ffmpeg.org/download.html](https://ffmpeg.org/download.html) — must be accessible from PATH (required for video export and some audio format conversions)
+- **Docker Desktop with WSL2 enabled** *(only required for the Higgs TTS 3 and ZONOS3-Mini backends)* — [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/) — install Docker Desktop and enable the *"Use the WSL 2 based engine"* option (Settings → General) **before running `install.bat`**. Make sure Docker Desktop is running when you install and use these backends.
 
 ### Installing a TTS backend
 
@@ -126,6 +127,10 @@ Run **`start.bat`** from the application root folder. It will list all installed
 ### Notes
 
 **TADA TTS** — requires a Hugging Face account token and **Meta Llama license approval**. During installation a dialog will ask for your token and prompt you to accept the Llama 3.2 license at [huggingface.co/meta-llama/Llama-3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B). Meta approval typically takes 10–20 minutes — do not proceed with installation until you receive the confirmation email.
+
+**Higgs TTS 3 and ZONOS3-Mini** — these backends run through WSL2 / Docker. Install Docker Desktop with WSL2 enabled and make sure it is running before choosing either of them in `install.bat`. Other backends do not need Docker.
+
+**ZONOS3-Mini** — uses SGLang-Omni and requires a minimum of 12 GB of VRAM and 32 GB of RAM. In Docker Desktop (Settings → Resources), allocate 20 GB of memory to the container.
 
 **Speaker diarization** (the *"I want dubbing"* feature in the SRT tab) requires a Hugging Face token and acceptance of the pyannote model terms. Before using it:
 1. Accept terms at [huggingface.co/pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
