@@ -248,7 +248,26 @@ class TTSWorker(QThread):
                         )
 
                 best_dur, best_path = min(temp_files, key=lambda c: c[0] - slot_s)
-                os.replace(best_path, output_path)
+
+                replaced = False
+                last_err: Optional[Exception] = None
+                for _retry in range(20):
+                    try:
+                        os.replace(best_path, output_path)
+                        replaced = True
+                        break
+                    except PermissionError as _e:
+                        last_err = _e
+                        time.sleep(0.25)
+
+                if not replaced:
+                    raise PermissionError(
+                        f"Output file is locked by another process "
+                        f"(video preview or audio player). "
+                        f"Close the video preview and retry. "
+                        f"Path: {output_path}"
+                    ) from last_err
+
                 temp_files = [c for c in temp_files if c[1] != best_path]
 
                 if max_attempts > 1 and not _fits(best_dur):
