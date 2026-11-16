@@ -1436,6 +1436,15 @@ class MainWindow(QMainWindow):
                     and not is_no_clone
                 )
 
+    def _backend_ref_text_unsupported(self) -> bool:
+        backend = getattr(self, "_backend", None)
+        if backend is None:
+            return False
+        try:
+            return not bool(getattr(backend, "reference_text_supported", True))
+        except Exception:
+            return False
+
     def _update_ref_text_visibility_for_model(self, model_id: str):
         is_moss = model_id.startswith("moss_tts")
         hide_ref_text = (
@@ -1447,6 +1456,7 @@ class MainWindow(QMainWindow):
             or model_id == "kitten2"
             or model_id == "veena"
             or model_id == "maya1"
+            or self._backend_ref_text_unsupported()
         )
         if hasattr(self, "_whisper_ref_text_label"):
             self._whisper_ref_text_label.setVisible(not hide_ref_text)
@@ -1524,6 +1534,8 @@ class MainWindow(QMainWindow):
             return "maya1"
         if model_id == "maya2_native":
             return "maya2"
+        if model_id == "zonos3_mini":
+            return "zonos3"
         return "clone"
 
     def _on_model_changed(self):
@@ -1587,6 +1599,8 @@ class MainWindow(QMainWindow):
         return self._drop.file_path or None
 
     def _get_ref_text(self) -> Optional[str]:
+        if self._backend_ref_text_unsupported():
+            return None
         if self._is_omnivoice_active():
             mode = (
                 self._voice_mode_combo.currentData()
@@ -2633,6 +2647,31 @@ class MainWindow(QMainWindow):
             if hasattr(self, "_model_combo")
             else None
         )
+
+        if self._backend_ref_text_unsupported():
+            hidden_labels = {
+                "Reference audio transcription:",
+                "Whisper size:",
+                "Transcription language:",
+            }
+            for spk in self._speaker_list:
+                sv = self._speaker_voices.get(spk)
+                if not sv:
+                    continue
+                for key in ("ref_text", "tr_btn", "w_size", "w_lang"):
+                    widget = sv.get(key)
+                    if widget is not None:
+                        widget.setVisible(False)
+            for idx in range(self._speakers_lay.count()):
+                item = self._speakers_lay.itemAt(idx)
+                group = item.widget() if item is not None else None
+                if group is None:
+                    continue
+                for lbl in group.findChildren(QLabel):
+                    if lbl.text() in hidden_labels:
+                        lbl.setVisible(False)
+            return
+
         if model_id != "maya2_native":
             return
 
