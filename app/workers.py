@@ -123,6 +123,8 @@ class TTSWorker(QThread):
 
         os.makedirs(self.output_dir, exist_ok=True)
 
+        gc_counter = 0
+
         for fragment in self.fragments:
             if self._cancelled:
                 break
@@ -301,9 +303,12 @@ class TTSWorker(QThread):
                             os.remove(tmp_path)
                     except OSError:
                         logger.warning(f"Could not remove temporary file: {tmp_path}")
-                gc.collect()
-                if TORCH_AVAILABLE and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                gc_counter += 1
+                if gc_counter >= 25:
+                    gc_counter = 0
+                    gc.collect()
+                    if TORCH_AVAILABLE and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             if self._cancelled:
                 break
