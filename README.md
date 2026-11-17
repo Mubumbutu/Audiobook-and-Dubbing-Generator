@@ -4,7 +4,7 @@
 
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.1.1-blue" />
+  <img alt="Version" src="https://img.shields.io/badge/version-1.1.2-blue" />
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white" />
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-lightgrey" />
   <img alt="CUDA" src="https://img.shields.io/badge/CUDA-11.8%20%7C%2012.1%20%7C%2012.4-76b900?logo=nvidia&logoColor=white" />
@@ -35,6 +35,37 @@ A desktop application for AI-powered text-to-speech synthesis, Lektor-style audi
 <summary><b>Version history</b> (click to expand)</summary>
 
 <br>
+
+### [1.1.2] - 2026-11-17
+
+If you already have update 1.1.1 installed, simply copy these files from GitHub into your application folder:
+audio_utils.py
+core.py
+utils.py
+workers.py
+tabs/srt_tab.py
+tabs/ebook_tab.py
+
+**Added**
+- Added **Export TXT** button next to "Export subtitles" in both SRT fragments and Ebook fragments tabs. Each fragment is saved as a separate paragraph in a UTF-8 `.txt` file, prefixed with `[Speaker]` when a speaker is set for that fragment.
+- Added Space key shortcut to pause and resume the currently playing waveform (video or generated fragment) in both SRT fragments and Ebook fragments tabs. Playback resumes from the paused position instead of restarting.
+
+**Fixed**
+- Fixed the dubbed voice being inaudible on phones and some players when the source video had a multichannel (e.g. 5.1) audio track. The mono dubbing track was mixed only into the center channel, which many devices drop when downmixing. The dubbing track is now duplicated to both left and right channels, and the original audio is downmixed to stereo before mixing.
+- Lektor video export now always outputs stereo AAC audio (including the separate original track when "Keep original track" is enabled).
+- Fixed Audiobook Export saving FLAC, OGG and OPUS files as MP3 data under the wrong extension. FLAC is now written natively, and MP3 / OGG / OPUS are encoded with the proper ffmpeg codec (`libmp3lame`, `libvorbis`, `libopus`).
+- Audiobook Export no longer depends on `pydub`.
+- If ffmpeg is not available, MP3 / OGG / OPUS audiobook export now falls back to WAV with the correct file extension, and encoding errors are reported instead of silently producing a wrong file.
+- Fixed "Simulate dubbed audio with video" starting the dubbed audio from the beginning of the fragment when enabled during playback. The dubbed audio now starts at the position matching the current video playhead, and stays in sync after pause, resume and seek.
+- "Trim aggressiveness" is now reset to `0.00` after "Trim all selected" completes successfully.
+- Fixed the application freezing when generating very large numbers of Ebook fragments (thousands) with all of them selected. The interface now stays responsive during synthesis.
+
+**Changed**
+- Exported lektor videos that had a 5.1 original track are now stereo instead of 5.1.
+- The "Model" section (model selection, download status and Load Model button) is now a collapsible section, expanded by default, like "Voice cloning" and "Generation parameters".
+- Pressing Space in the fragment list now controls playback instead of toggling the checkbox of the selected fragment.
+- Improved Ebook tab performance with large fragment lists: fragment lookups are indexed, the preview button state is refreshed with a short delay, generated files are registered in the file watcher in small batches after synthesis, and memory cleanup runs every 25 fragments instead of after every fragment.
+- Reading the duration of generated audio files is faster, as only the file header is read.
 
 ### [1.1.1] - 2026-11-16
 
