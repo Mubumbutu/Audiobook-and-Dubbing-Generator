@@ -61,14 +61,16 @@ def _check_ffmpeg() -> bool:
 
 def _get_wav_duration(path: str) -> Optional[float]:
     try:
+        info = sf.info(path)
+        if info.samplerate > 0:
+            return info.frames / info.samplerate
+    except Exception:
+        pass
+    try:
         info = torchaudio.info(path)
         return info.num_frames / info.sample_rate
     except Exception:
-        try:
-            data, sr = sf.read(path)
-            return len(data) / sr
-        except Exception:
-            return None
+        return None
 
 
 def _detect_srt_language(texts: List[str]) -> str:
