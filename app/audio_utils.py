@@ -292,6 +292,7 @@ def start_play(main_window):
     main_window._cursor = s_sample
     main_window._play_end_sample = e_sample
     main_window._playing = True
+    main_window._last_play_source = 'fragment'
     main_window._play_btn.setText("■  Pause")
     main_window._timer.start()
 
@@ -634,6 +635,16 @@ def apply_trim_to_selected(main_window):
             trimmed += 1
         except Exception as e:
             logger.warning(f"Trim failed for fragment {frag.get('index')}: {e}")
+
+    if trimmed > 0:
+        main_window._trim_slider.blockSignals(True)
+        main_window._trim_input.blockSignals(True)
+        try:
+            main_window._trim_slider.setValue(0)
+            main_window._trim_input.setValue(0.0)
+        finally:
+            main_window._trim_slider.blockSignals(False)
+            main_window._trim_input.blockSignals(False)
 
     main_window._wave_out.clear_trim_preview()
     main_window._update_trim_preview()
