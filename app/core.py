@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
     QGridLayout, QDialog, QDialogButtonBox, QInputDialog, QDoubleSpinBox, QHeaderView,
     QRadioButton,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl, QFileSystemWatcher
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl, QFileSystemWatcher, QEvent
 from PyQt6.QtGui import (
     QFont, QColor, QPainter, QIcon, QPixmap,
     QDragEnterEvent, QDropEvent, QKeySequence, QShortcut, QPen, QAction,
@@ -311,6 +311,9 @@ class MainWindow(QMainWindow):
 
         QShortcut(QKeySequence("Ctrl+Z"), self).activated.connect(self.undo_manager.undo)
         QShortcut(QKeySequence("Ctrl+Y"), self).activated.connect(self.undo_manager.redo)
+        self._last_play_source = None
+        self._video_player.playback_state_changed.connect(self._remember_video_play_source)
+        QApplication.instance().installEventFilter(self)
 
         self._status_bar = QStatusBar()
         self._status_lbl = QLabel("…")
@@ -382,7 +385,7 @@ class MainWindow(QMainWindow):
         self.ebook_tab = EbookTab(self)
         self.quick_tab = QuickTTSTab(self)
 
-        self._tabs.addTab(self.srt_tab.get_widget(), "📄  SRT Fragments")
+        self._tabs.addTab(self.srt_tab.get_widget(), "📄  Video Fragments")
         self._tabs.addTab(self.ebook_tab.get_widget(), "📚  Ebook Fragments")
         self._tabs.addTab(self.quick_tab.get_widget(), "⚡  Quick TTS")
 
@@ -404,8 +407,11 @@ class MainWindow(QMainWindow):
         lay.setSpacing(10)
         lay.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        model_grp = QGroupBox("Model")
-        model_lay = QVBoxLayout(model_grp)
+        model_section = CollapsibleSection("🤖 Model", C["accent"])
+        model_container = QWidget()
+        model_container.setStyleSheet("background: transparent;")
+        model_lay = QVBoxLayout(model_container)
+        model_lay.setContentsMargins(0, 0, 0, 0)
         model_lay.setSpacing(8)
         model_row = QHBoxLayout()
         model_row.setSpacing(6)
@@ -442,7 +448,10 @@ class MainWindow(QMainWindow):
         status_row.addWidget(self._load_btn)
         status_row.addWidget(self._unload_btn)
         model_lay.addLayout(status_row)
-        lay.addWidget(model_grp)
+        model_section.add_widget(model_container)
+        model_section.expand()
+        lay.addWidget(model_section)
+        self._model_section = model_section
 
         voice_section = CollapsibleSection("🎙 Voice cloning", C["accent"])
         self._voice_single_container = QWidget()
@@ -1279,6 +1288,56 @@ class MainWindow(QMainWindow):
 
     def _load_audio_to_player(self, audio: np.ndarray, sr: int, fragment_idx: Optional[int] = None):
         load_audio_to_player(self, audio, sr, fragment_idx=fragment_idx)
+
+    def _remember_video_play_source(self, playing: bool):
+        if playing:
+            self._last_play_source = 'video'
+
+    def eventFilter(self, obj, event):
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key.Key_Space
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and QApplication.activeWindow() is self
+        ):
+            focus = QApplication.focusWidget()
+            if (
+                focus is not None
+                and obj is focus
+                and isinstance(focus, (FragmentTreeWidget, WaveformWidget, SelectionWaveformWidget))
+            ):
+                if not event.isAutoRepeat():
+                    self._toggle_active_playback()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _toggle_active_playback(self):
+        video = self._video_player
+        video_has_media = video.isVisible() and video.has_media()
+        video_playing = video_has_media and video.is_playing()
+        fragment_playing = bool(self._playing)
+
+        if video_playing or fragment_playing:
+            if video_playing and not fragment_playing:
+                self._last_play_source = 'video'
+            elif fragment_playing and not video_playing:
+                self._last_play_source = 'fragment'
+            if video_playing:
+                video.toggle_play()
+            if fragment_playing:
+                self._pause_play()
+            return
+
+        has_fragment = self._audio_data is not None
+        source = getattr(self, '_last_play_source', None)
+        if source == 'video' and video_has_media:
+            video.toggle_play()
+        elif source == 'fragment' and has_fragment:
+            self._start_play()
+        elif has_fragment:
+            self._start_play()
+        elif video_has_media:
+            video.toggle_play()
 
     def _start_play(self):
         start_play(self)
