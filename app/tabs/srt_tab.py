@@ -4596,6 +4596,60 @@ class SrtTab(BaseTab):
         except Exception:
             self.main._on_error("Subtitles export error", traceback.format_exc())
 
+    def _export_text(self):
+        if not self._fragments:
+            QMessageBox.warning(self.main, "No SRT loaded", "Load an SRT or TXT file first.")
+            return
+
+        frags = sorted(self._fragments, key=lambda f: f.get('start_ms', 0) or 0)
+
+        paragraphs = []
+        for frag in frags:
+            text = (frag.get('text') or '').replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ').strip()
+            if not text:
+                continue
+            speaker = str(frag.get('speaker') or '').strip()
+            paragraphs.append(f"[{speaker}] {text}" if speaker else text)
+
+        if not paragraphs:
+            QMessageBox.warning(self.main, "No text", "There is no text to export.")
+            return
+
+        base_name = Path(self._srt_path).stem if self._srt_path else "text"
+        default_path = str(
+            Path(_get_last_dir("output", self._output_dir)) / f"{base_name}.txt"
+        )
+
+        path, _ = QFileDialog.getSaveFileName(
+            self.main,
+            "Save text",
+            default_path,
+            "Text files (*.txt);;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".txt"):
+            path += ".txt"
+
+        _set_last_dir("output", path)
+
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(paragraphs) + "\n")
+
+            self.main._set_status(f"Text saved: {path}", C["success"])
+
+            reply = QMessageBox.information(
+                self.main, "Export complete",
+                f"Text saved successfully:\n{path}\n\nOpen output folder?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                _open_file(os.path.dirname(path))
+
+        except Exception:
+            self.main._on_error("Text export error", traceback.format_exc())
+
     def _ms_to_srt_timestamp(self, ms: float) -> str:
         total_ms = max(0, int(round(ms)))
         hours, rem = divmod(total_ms, 3600000)
@@ -4731,6 +4785,9 @@ class SrtTab(BaseTab):
 
         primary_audio = external_audio_path if external_audio_path else video_path
 
+        lektor_stereo = "aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0"
+        to_stereo = "aformat=channel_layouts=stereo"
+
         cmd = ["ffmpeg", "-y"]
 
         if has_video_audio:
@@ -4742,19 +4799,19 @@ class SrtTab(BaseTab):
 
                 if use_ducking:
                     audio_filter = (
-                        f"[1:a]volume={orig_vol:.2f}[bg];"
-                        f"[2:a]volume={vocal_suppress_vol:.2f}[vox];"
+                        f"[1:a]{to_stereo},volume={orig_vol:.2f}[bg];"
+                        f"[2:a]{to_stereo},volume={vocal_suppress_vol:.2f}[vox];"
                         f"[bg][vox]amix=inputs=2:duration=longest:normalize=0[orig_mix];"
-                        f"[3:a]volume={lektor_vol:.2f},asplit=2[lekt1][lekt2];"
+                        f"[3:a]{lektor_stereo},volume={lektor_vol:.2f},asplit=2[lekt1][lekt2];"
                         f"[orig_mix][lekt1]sidechaincompress="
                         f"threshold=0.025:ratio=4:attack=10:release=400[ducked];"
                         f"[ducked][lekt2]amix=inputs=2:duration=longest:normalize=0[aout]"
                     )
                 else:
                     audio_filter = (
-                        f"[1:a]volume={orig_vol:.2f}[bg];"
-                        f"[2:a]volume={vocal_suppress_vol:.2f}[vox];"
-                        f"[3:a]volume={lektor_vol:.2f}[lekt];"
+                        f"[1:a]{to_stereo},volume={orig_vol:.2f}[bg];"
+                        f"[2:a]{to_stereo},volume={vocal_suppress_vol:.2f}[vox];"
+                        f"[3:a]{lektor_stereo},volume={lektor_vol:.2f}[lekt];"
                         f"[bg][vox][lekt]amix=inputs=3:duration=longest:normalize=0[aout]"
                     )
 
@@ -4767,7 +4824,7 @@ class SrtTab(BaseTab):
                     cmd.extend(["-map", "[aout]"])
                     cmd.extend([
                         "-c:v", "copy",
-                        "-c:a", "aac", "-b:a", "192k",
+                        "-c:a", "aac", "-b:a", "192k", "-ac", "2",
                         "-metadata:s:a:0", "title=Original",
                         "-metadata:s:a:1", "title=Dubbing",
                         "-metadata:s:a:1", f"language={dubbed_lang}",
@@ -4778,7 +4835,7 @@ class SrtTab(BaseTab):
                     cmd.extend(["-map", "[aout]"])
                     cmd.extend([
                         "-c:v", "copy",
-                        "-c:a", "aac", "-b:a", "192k"
+                        "-c:a", "aac", "-b:a", "192k", "-ac", "2"
                     ])
 
             else:
@@ -4788,16 +4845,16 @@ class SrtTab(BaseTab):
 
                 if use_ducking:
                     audio_filter = (
-                        f"[2:a]volume={lektor_vol:.2f},asplit=2[lekt1][lekt2];"
-                        f"[1:a]volume={orig_vol:.2f}[orig];"
+                        f"[2:a]{lektor_stereo},volume={lektor_vol:.2f},asplit=2[lekt1][lekt2];"
+                        f"[1:a]{to_stereo},volume={orig_vol:.2f}[orig];"
                         f"[orig][lekt1]sidechaincompress="
                         f"threshold=0.025:ratio=4:attack=10:release=400[ducked];"
                         f"[ducked][lekt2]amix=inputs=2:duration=longest:normalize=0[aout]"
                     )
                 else:
                     audio_filter = (
-                        f"[1:a]volume={orig_vol:.2f}[orig];"
-                        f"[2:a]volume={lektor_vol:.2f}[lekt];"
+                        f"[1:a]{to_stereo},volume={orig_vol:.2f}[orig];"
+                        f"[2:a]{lektor_stereo},volume={lektor_vol:.2f}[lekt];"
                         f"[orig][lekt]amix=inputs=2:duration=longest:normalize=0[aout]"
                     )
 
@@ -4809,7 +4866,7 @@ class SrtTab(BaseTab):
                     cmd.extend(["-map", "[aout]"])
                     cmd.extend([
                         "-c:v", "copy",
-                        "-c:a", "aac", "-b:a", "192k",
+                        "-c:a", "aac", "-b:a", "192k", "-ac", "2",
                         "-metadata:s:a:0", "title=Original",
                         "-metadata:s:a:1", "title=Dubbing",
                         "-metadata:s:a:1", f"language={dubbed_lang}",
@@ -4820,7 +4877,7 @@ class SrtTab(BaseTab):
                     cmd.extend(["-map", "[aout]"])
                     cmd.extend([
                         "-c:v", "copy",
-                        "-c:a", "aac", "-b:a", "192k"
+                        "-c:a", "aac", "-b:a", "192k", "-ac", "2"
                     ])
         else:
             cmd.extend(["-i", video_path])
@@ -4829,7 +4886,7 @@ class SrtTab(BaseTab):
                 "-map", "0:v:0",
                 "-map", "1:a:0",
                 "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k",
+                "-c:a", "aac", "-b:a", "192k", "-ac", "2",
                 "-af", f"volume={lektor_vol:.2f}"
             ])
 
@@ -5853,6 +5910,10 @@ class SrtTab(BaseTab):
         self._subtitles_export_btn.setStyleSheet(_btn(C["accent"]))
         self._subtitles_export_btn.clicked.connect(self._export_subtitles)
         exp_row.addWidget(self._subtitles_export_btn)
+        self._text_export_btn = QPushButton("📄  Export TXT")
+        self._text_export_btn.setStyleSheet(_btn(C["accent"]))
+        self._text_export_btn.clicked.connect(self._export_text)
+        exp_row.addWidget(self._text_export_btn)
         lay.addLayout(exp_row)
 
         self._lektor_status = QLabel("")
@@ -5872,6 +5933,89 @@ class SrtTab(BaseTab):
             if getattr(self, '_dub_player', None):
                 self._dub_player.pause()
             self._pause_extra_dub_players()
+
+    def _dub_offset_for(self, entry: Dict) -> int:
+        pos_ms = self.main._video_player.position_seconds() * 1000.0
+        return max(0, int((pos_ms - entry['start_ms']) * entry['rate']))
+
+    def _dub_is_pending(self, player) -> bool:
+        pending = getattr(self, '_dub_pending', None)
+        if not pending:
+            return False
+        item = pending.get(id(player))
+        if item is None:
+            return False
+        if time.monotonic() - item[1] > 2.0:
+            pending.pop(id(player), None)
+            return False
+        return True
+
+    def _dub_load_and_play(self, player, entry: Dict, video_playing: bool) -> None:
+        if getattr(self, '_dub_pending', None) is None:
+            self._dub_pending = {}
+        if getattr(self, '_dub_hooked', None) is None:
+            self._dub_hooked = set()
+        if id(player) not in self._dub_hooked:
+            self._dub_hooked.add(id(player))
+            player.mediaStatusChanged.connect(
+                lambda status, p=player: self._on_dub_media_status(p, status)
+            )
+
+        url = QUrl.fromLocalFile(entry['output_path'])
+        ready = (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+            QMediaPlayer.MediaStatus.EndOfMedia,
+        )
+        status = player.mediaStatus()
+
+        if player.source() == url and status in ready:
+            self._dub_pending.pop(id(player), None)
+            player.setPlaybackRate(entry['rate'])
+            player.setPosition(self._dub_offset_for(entry))
+            if video_playing:
+                player.play()
+            return
+
+        if player.source() == url and status in (
+            QMediaPlayer.MediaStatus.NoMedia,
+            QMediaPlayer.MediaStatus.InvalidMedia,
+        ):
+            player.setSource(QUrl())
+
+        self._dub_pending[id(player)] = (entry, time.monotonic())
+        if player.source() != url:
+            player.setSource(url)
+
+    def _on_dub_media_status(self, player, status) -> None:
+        pending = getattr(self, '_dub_pending', None)
+        if not pending or id(player) not in pending:
+            return
+        if status not in (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        ):
+            return
+        entry, _stamp = pending[id(player)]
+        if player.source() != QUrl.fromLocalFile(entry['output_path']):
+            return
+        pending.pop(id(player), None)
+
+        if self._dub_sync_held():
+            return
+        if not getattr(self, '_sim_dub_check', None) or not self._sim_dub_check.isChecked():
+            return
+        video = self.main._video_player
+        if not video.has_media():
+            return
+        pos_ms = video.position_seconds() * 1000.0
+        if not (entry['start_ms'] <= pos_ms < entry['end_ms']):
+            return
+
+        player.setPlaybackRate(entry['rate'])
+        player.setPosition(self._dub_offset_for(entry))
+        if video.is_playing():
+            player.play()
 
     def _resync_dub_player(self):
         if not getattr(self, '_dub_player', None):
@@ -5908,10 +6052,10 @@ class SrtTab(BaseTab):
             or self._dub_player.source() != url
         ):
             self._current_sim_frag_idx = entry['index']
-            self._dub_player.setSource(url)
-            self._dub_player.setPlaybackRate(entry['rate'])
-            self._dub_player.setPosition(offset_ms)
-            self._dub_player.play()
+            self._dub_load_and_play(self._dub_player, entry, True)
+            return
+
+        if self._dub_is_pending(self._dub_player):
             return
 
         state = self._dub_player.playbackState()
@@ -6053,13 +6197,10 @@ class SrtTab(BaseTab):
 
             if changed_fragment:
                 self._current_sim_frag_idx = frag_idx
-                self._dub_player.setSource(
-                    QUrl.fromLocalFile(matching_entry['output_path'])
-                )
-                self._dub_player.setPlaybackRate(matching_entry['rate'])
-                self._dub_player.setPosition(int(frag_offset_ms))
-                if is_video_playing:
-                    self._dub_player.play()
+                self._dub_load_and_play(self._dub_player, matching_entry, is_video_playing)
+
+            elif self._dub_is_pending(self._dub_player):
+                pass
 
             elif is_seek:
                 self._dub_player.setPlaybackRate(matching_entry['rate'])
@@ -6152,11 +6293,9 @@ class SrtTab(BaseTab):
 
             if state.get(lane) != frag_idx:
                 state[lane] = frag_idx
-                player.setSource(QUrl.fromLocalFile(match['output_path']))
-                player.setPlaybackRate(match['rate'])
-                player.setPosition(offset_ms)
-                if is_video_playing:
-                    player.play()
+                self._dub_load_and_play(player, match, is_video_playing)
+            elif self._dub_is_pending(player):
+                continue
             elif is_seek:
                 player.setPlaybackRate(match['rate'])
                 player.setPosition(offset_ms)
