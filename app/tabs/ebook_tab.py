@@ -59,6 +59,7 @@ class EbookTab(BaseTab):
         super().__init__(main_window)
         self._ebook_fragments: List[Dict] = []
         self._ebook_frag_items: Dict[int, QTreeWidgetItem] = {}
+        self._frag_by_index: Dict[int, Dict] = {}
         self._ebook_chapter_item: Optional[QTreeWidgetItem] = None
         self._epub_path: Optional[str] = None
         self._ebook_output_dir: str = ""
@@ -96,6 +97,16 @@ class EbookTab(BaseTab):
         self._norm_check = None
         self._file_watcher = main_window._file_watcher
 
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(150)
+        self._preview_timer.timeout.connect(self._do_update_preview_btn_state)
+
+        self._watch_queue: List[str] = []
+        self._watch_timer = QTimer(self)
+        self._watch_timer.setInterval(50)
+        self._watch_timer.timeout.connect(self._flush_watch_queue)
+
         self._build_ui()
 
     def set_shared_widgets(self, btn_start, btn_stop, synth_progress, eta_label, progress, norm_check):
@@ -106,6 +117,7 @@ class EbookTab(BaseTab):
         self._eta_label = eta_label
         self._progress = progress
         self._norm_check = norm_check
+        self._ebook_tree.setUniformRowHeights(True)
         self._ebook_tree.itemChanged.connect(self._on_item_check_changed)
 
     def get_widget(self) -> QWidget:
@@ -374,6 +386,8 @@ class EbookTab(BaseTab):
         self.main.undo_manager.clear()
         self._ebook_fragments.clear()
         self._ebook_frag_items.clear()
+        self._frag_by_index.clear()
+        self._watch_queue.clear()
         self._ebook_chapter_item = None
         self._epub_path = None
         self._ebook_tree.clear()
@@ -394,6 +408,7 @@ class EbookTab(BaseTab):
     def _populate_ebook_tree(self):
         self._ebook_tree.clear()
         self._ebook_frag_items.clear()
+        self._frag_by_index = {f['index']: f for f in self._ebook_fragments}
         if not self._ebook_fragments:
             return
 
@@ -421,6 +436,12 @@ class EbookTab(BaseTab):
         if self._ebook_filter_edit is not None:
             self._apply_ebook_filter(self._ebook_filter_edit.text())
         self._update_preview_btn_state()
+
+    def _frag_for_index(self, idx: int) -> Optional[Dict]:
+        frag = self._frag_by_index.get(idx)
+        if frag is not None and frag.get('index') == idx:
+            return frag
+        return next((f for f in self._ebook_fragments if f.get('index') == idx), None)
 
     def _create_ebook_tree_item(self, frag: Dict, parent=None) -> QTreeWidgetItem:
         status = frag.get('status', 'waiting')
@@ -477,7 +498,7 @@ class EbookTab(BaseTab):
         item = self._ebook_frag_items.get(idx)
         if not item:
             return
-        frag = next((f for f in self._ebook_fragments if f['index'] == idx), None)
+        frag = self._frag_for_index(idx)
         if not frag:
             return
         status = frag.get('status', 'waiting')
@@ -667,13 +688,13 @@ class EbookTab(BaseTab):
         if idx is None:
             return
         self._load_fragment_audio(idx)
-        frag = next((f for f in self._ebook_fragments if f['index'] == idx), None)
+        frag = self._frag_for_index(idx)
         if not frag:
             return
         self._ebook_preview_text.setPlainText(frag.get('text', ''))
 
     def _load_fragment_audio(self, idx: int) -> bool:
-        frag = next((f for f in self._ebook_fragments if f.get('index') == idx), None)
+        frag = self._frag_for_index(idx)
         if not frag or frag.get('status') != 'done':
             return False
 
@@ -713,7 +734,7 @@ class EbookTab(BaseTab):
             if child.isHidden():
                 continue
             idx = child.data(COL_STATUS, Qt.ItemDataRole.UserRole)
-            frag = next((f for f in self._ebook_fragments if f['index'] == idx), None)
+            frag = self._frag_for_index(idx)
             if not frag:
                 continue
             if retry_errors:
@@ -750,10 +771,14 @@ class EbookTab(BaseTab):
                                             "No pending fragments left to process.")
                     return
 
-        for frag in to_process:
-            frag["status"] = "waiting"
-            frag["error_msg"] = None
-            self._update_ebook_tree_item(frag["index"])
+        self._ebook_tree.setUpdatesEnabled(False)
+        try:
+            for frag in to_process:
+                frag["status"] = "waiting"
+                frag["error_msg"] = None
+                self._update_ebook_tree_item(frag["index"])
+        finally:
+            self._ebook_tree.setUpdatesEnabled(True)
 
         self._synthesis_source = 'ebook'
         self._is_running = True
@@ -795,15 +820,17 @@ class EbookTab(BaseTab):
 
     def _on_progress(self, idx: int, msg: str, is_error: bool):
         if idx >= 0:
-            frag = next((f for f in self._ebook_fragments if f['index'] == idx), None)
+            frag = self._frag_for_index(idx)
             if frag:
-                frag['status'] = 'running' if not is_error else 'error'
-                self._update_ebook_tree_item(idx)
+                new_status = 'error' if is_error else 'running'
+                if frag.get('status') != new_status:
+                    frag['status'] = new_status
+                    self._update_ebook_tree_item(idx)
         color = C["error"] if is_error else C["text2"]
         self.main._set_status(msg, color)
 
     def _on_item_done(self, idx: int, result: str, is_error: bool):
-        frag = next((f for f in self._ebook_fragments if f['index'] == idx), None)
+        frag = self._frag_for_index(idx)
         if not frag:
             return
         if is_error:
@@ -813,13 +840,16 @@ class EbookTab(BaseTab):
             frag['status'] = 'done'
             frag['output_path'] = result
             frag['error_msg'] = None
+            frag['_checked'] = False
             item = self._ebook_frag_items.get(idx)
             if item:
-                item.setCheckState(COL_STATUS, Qt.CheckState.Unchecked)
+                self._ebook_tree.blockSignals(True)
+                try:
+                    item.setCheckState(COL_STATUS, Qt.CheckState.Unchecked)
+                finally:
+                    self._ebook_tree.blockSignals(False)
             if result and os.path.exists(result):
-                watched = self._file_watcher.files()
-                if result not in watched:
-                    self._file_watcher.addPath(result)
+                self._watch_queue.append(result)
 
         self._update_ebook_tree_item(idx)
 
@@ -871,10 +901,25 @@ class EbookTab(BaseTab):
         self.main._update_action_buttons()
         logger.info(f"Synthesis finished: {done} done, {error} errors")
 
+        if self._watch_queue:
+            self._watch_timer.start()
+
         auto = self._auto_ebook_session_path()
         if auto:
             if self._write_ebook_session_to(str(auto)):
                 logger.info(f"Auto-saved ebook session: {auto}")
+
+    def _flush_watch_queue(self):
+        if not self._watch_queue:
+            self._watch_timer.stop()
+            return
+        batch = self._watch_queue[:100]
+        del self._watch_queue[:100]
+        existing = [p for p in batch if os.path.exists(p)]
+        if existing:
+            self._file_watcher.addPaths(existing)
+        if not self._watch_queue:
+            self._watch_timer.stop()
 
     def _re_synthesize_ebook_fragment(self, frag: Dict):
         if not self.main._model_is_loaded:
@@ -2154,6 +2199,10 @@ class EbookTab(BaseTab):
         self._audiobook_subtitles_btn.setStyleSheet(_btn(C["accent"]))
         self._audiobook_subtitles_btn.clicked.connect(self._export_subtitles)
         exp_row.addWidget(self._audiobook_subtitles_btn)
+        self._audiobook_text_btn = QPushButton("📄  Export TXT")
+        self._audiobook_text_btn.setStyleSheet(_btn(C["accent"]))
+        self._audiobook_text_btn.clicked.connect(self._export_text)
+        exp_row.addWidget(self._audiobook_text_btn)
         exp_row.addStretch()
         self.main._audiobook_section.add_layout(exp_row)
 
@@ -2257,15 +2306,28 @@ class EbookTab(BaseTab):
 
             if fmt == "wav":
                 sf.write(path, full_audio, sr, subtype="PCM_16")
+            elif fmt == "flac":
+                sf.write(path, full_audio, sr, format="FLAC", subtype="PCM_16")
+            elif not self.main._ffmpeg_ok:
+                path = os.path.splitext(path)[0] + ".wav"
+                sf.write(path, full_audio, sr, subtype="PCM_16")
             else:
+                codec_args = {
+                    "mp3": ["-c:a", "libmp3lame", "-b:a", "192k"],
+                    "ogg": ["-c:a", "libvorbis", "-q:a", "5"],
+                    "opus": ["-c:a", "libopus", "-b:a", "96k"],
+                }.get(fmt, [])
                 tmp_wav = tempfile.mktemp(suffix=".wav")
-                sf.write(tmp_wav, full_audio, sr, subtype="PCM_16")
                 try:
-                    from pydub import AudioSegment
-                    AudioSegment.from_wav(tmp_wav).export(path, format="mp3", bitrate="192k")
-                except ImportError:
-                    path = path.replace(".mp3", ".wav")
-                    sf.write(path, full_audio, sr, subtype="PCM_16")
+                    sf.write(tmp_wav, full_audio, sr, subtype="PCM_16")
+                    result = subprocess.run(
+                        ["ffmpeg", "-y", "-i", tmp_wav, *codec_args, path],
+                        capture_output=True,
+                        timeout=600,
+                    )
+                    if result.returncode != 0:
+                        err_tail = result.stderr.decode(errors="replace").strip()[-500:]
+                        raise RuntimeError(f"ffmpeg failed to encode {fmt.upper()}: {err_tail}")
                 finally:
                     try:
                         os.unlink(tmp_wav)
@@ -2372,6 +2434,60 @@ class EbookTab(BaseTab):
 
         except Exception:
             self.main._on_error("Subtitles export error", traceback.format_exc())
+
+    def _export_text(self):
+        if not self._ebook_fragments:
+            QMessageBox.warning(self.main, "No ebook loaded", "Load an EPUB or TXT first.")
+            return
+
+        frags = sorted(self._ebook_fragments, key=lambda f: f['index'])
+
+        paragraphs = []
+        for frag in frags:
+            text = (frag.get('text') or '').replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ').strip()
+            if not text:
+                continue
+            speaker = str(frag.get('speaker') or '').strip()
+            paragraphs.append(f"[{speaker}] {text}" if speaker else text)
+
+        if not paragraphs:
+            QMessageBox.warning(self.main, "No text", "There is no text to export.")
+            return
+
+        base_name = Path(self._epub_path).stem if self._epub_path else "audiobook"
+        default_path = str(
+            Path(_get_last_dir("output", self._ebook_output_dir)) / f"{base_name}.txt"
+        )
+
+        path, _ = QFileDialog.getSaveFileName(
+            self.main,
+            "Save text",
+            default_path,
+            "Text files (*.txt);;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".txt"):
+            path += ".txt"
+
+        _set_last_dir("output", path)
+
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(paragraphs) + "\n")
+
+            self.main._set_status(f"Text saved: {path}", C["success"])
+
+            reply = QMessageBox.information(
+                self.main, "Export complete",
+                f"Text saved successfully:\n{path}\n\nOpen output folder?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                _open_file(os.path.dirname(path))
+
+        except Exception:
+            self.main._on_error("Text export error", traceback.format_exc())
 
     def _ms_to_srt_timestamp(self, ms: float) -> str:
         total_ms = max(0, int(round(ms)))
@@ -2571,7 +2687,10 @@ class EbookTab(BaseTab):
         return pre_arr, post_arr
 
     def _update_preview_btn_state(self):
-        if not hasattr(self, '_preview_audiobook_btn'):
+        self._preview_timer.start()
+
+    def _do_update_preview_btn_state(self):
+        if self._preview_audiobook_btn is None:
             return
         if not hasattr(self, '_ebook_chapter_item') or not self._ebook_chapter_item:
             self._preview_audiobook_btn.setEnabled(False)
@@ -2600,7 +2719,7 @@ class EbookTab(BaseTab):
         has_done = False
         for i in checked_positions:
             idx = visible_items[i].data(COL_STATUS, Qt.ItemDataRole.UserRole)
-            frag = next((f for f in self._ebook_fragments if f['index'] == idx), None)
+            frag = self._frag_for_index(idx)
             if frag and frag.get('status') == 'done' and frag.get('output_path') and os.path.exists(frag['output_path']):
                 has_done = True
                 break
