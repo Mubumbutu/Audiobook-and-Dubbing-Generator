@@ -25,6 +25,7 @@ if not exist "app\main.py" (
 )
 
 set "LABEL_venv_audio8=Audio8 TTS Preview and Realistic 0.6B"
+set "LABEL_venv_breeze_2=Breeze TTS 2"
 set "LABEL_venv_chatterbox=Chatterbox TTS"
 set "LABEL_venv_fish_s2_pro=Fish Audio Speech-2 Pro"
 set "LABEL_venv_higgs_wsl=Higgs TTS 3 (WSL2)"
@@ -65,7 +66,8 @@ echo  Available TTS environments:
 echo.
 for /l %%I in (1,1,!COUNT!) do (
     set "VNAME=!VENV_%%I!"
-    set "DISP=!LABEL_%VNAME%!"
+    set "DISP="
+    call set "DISP=%%LABEL_!VNAME!%%"
     if not defined DISP set "DISP=!VNAME!"
     echo  [%%I]  !DISP!  ^(!VNAME!^)
 )
