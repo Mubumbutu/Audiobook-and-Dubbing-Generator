@@ -4,7 +4,7 @@
 
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.1.2-blue" />
+  <img alt="Version" src="https://img.shields.io/badge/version-1.1.3-blue" />
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white" />
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-lightgrey" />
   <img alt="CUDA" src="https://img.shields.io/badge/CUDA-11.8%20%7C%2012.1%20%7C%2012.4-76b900?logo=nvidia&logoColor=white" />
@@ -35,6 +35,18 @@ A desktop application for AI-powered text-to-speech synthesis, Lektor-style audi
 <summary><b>Version history</b> (click to expand)</summary>
 
 <br>
+
+### [1.1.3] - 2026-11-18
+
+Only one new model. If you already have update 1.1.2 installed, simply copy these files from GitHub into your application folder:
+install.bat
+start.bat
+app/breeze_2_backend.py
+install/breeze_2_install.bat
+install/breeze_2_requirements.txt
+
+**Added**
+- Breeze TTS 2 backend (English / Chinese only) with Voice Clone, Voice Design and Voice Direction modes, vocal events such as `(laugh)` / `[笑]`, optional seed and CFG scale. It runs as a local streaming server, so it needs an NVIDIA GPU with at least 8 GB of VRAM.
 
 ### [1.1.2] - 2026-11-17
 
@@ -197,6 +209,7 @@ The app supports multiple TTS backends. Available backends are detected automati
 | Maya1 | [huggingface.co/maya-research/maya1](https://huggingface.co/maya-research/maya1) |
 | Maya2 Native | [huggingface.co/maya-research/maya2-native](https://huggingface.co/maya-research/maya2-native) |
 | ZONOS3 Mini | [huggingface.co/Zyphra/ZONOS3-Mini](https://huggingface.co/Zyphra/ZONOS3-Mini) |
+| Breeze TTS 2 | [huggingface.co/BreezeBlue/Breeze-TTS-2](https://huggingface.co/BreezeBlue/Breeze-TTS-2) |
 
 Most backends support **voice cloning** via a reference audio file. You can upload a reference `.wav`, optionally pre-process it (resample, convert to mono, normalize, isolate vocals via Demucs), and optionally transcribe it using Whisper before synthesis.
 
